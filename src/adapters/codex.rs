@@ -44,7 +44,10 @@ impl Adapter for CodexAdapter {
         let mut tools: BTreeMap<String, u32> = BTreeMap::new();
         let mut first_ts: Option<DateTime<Utc>> = None;
         let mut last_ts: Option<DateTime<Utc>> = None;
-        let mut last_total: Option<(u64,u64,u64,u64)> = None; // (input_total, cached, output, reasoning)
+        // (input_total, cached, output, reasoning); also track the peak cumulative total seen.
+        let mut last_total: Option<(u64,u64,u64,u64)> = None;
+        let mut peak_total: Option<(u64,u64,u64,u64)> = None; // event with highest total_tokens
+        let mut peak_tokens: u64 = 0;
 
         for line in BufReader::new(f).lines() {
             let line = line?;
@@ -72,12 +75,19 @@ impl Adapter for CodexAdapter {
                         "token_count" => {
                             if let Some(info) = p.get("info") {
                                 if let Some(tot) = info.get("total_token_usage") {
-                                    last_total = Some((
+                                    let entry = (
                                         u(tot, "input_tokens"),
                                         u(tot, "cached_input_tokens"),
                                         u(tot, "output_tokens"),
                                         u(tot, "reasoning_output_tokens"),
-                                    ));
+                                    );
+                                    let total_tokens = u(tot, "total_tokens");
+                                    // Track the peak cumulative total seen across all events.
+                                    if total_tokens >= peak_tokens {
+                                        peak_tokens = total_tokens;
+                                        peak_total = Some(entry);
+                                    }
+                                    last_total = Some(entry);
                                 }
                             }
                         }
@@ -89,9 +99,36 @@ impl Adapter for CodexAdapter {
         }
 
         let mut records = Vec::new();
-        if let Some((input_total, cached, output, reasoning)) = last_total {
-            let input = input_total.saturating_sub(cached);
-            let cache_read = cached;
+        if let Some(last) = last_total {
+            // (b) Non-monotonic check: if the last event's cumulative total is below the peak,
+            // the stream was truncated/resumed. Use the peak event's data instead.
+            let chosen = if let Some(peak) = peak_total {
+                let last_tokens = last.0 + last.2; // input + output as proxy (total_tokens not stored)
+                // Compare using peak_tokens which we tracked precisely.
+                // Recompute last's total for comparison.
+                let last_total_approx = last.0 + last.2 + last.3;
+                if peak_tokens > 0 && last_total_approx < peak_tokens {
+                    eprintln!("warn: codex session '{}': last token_count event total ({}) is less \
+                        than peak seen ({}); using peak event instead",
+                        session_id, last_total_approx, peak_tokens);
+                    let _ = last_tokens; // suppress unused warning
+                    peak
+                } else {
+                    last
+                }
+            } else {
+                last
+            };
+
+            let (input_total, cached, output, reasoning) = chosen;
+            // (a) Clamp cache_read so input + cache_read == input_total always.
+            let cache_read = cached.min(input_total);
+            if cached > input_total {
+                eprintln!("warn: codex session '{}': cached_input_tokens ({}) > input_tokens ({}); \
+                    clamping cache_read to input_total to preserve bucket invariant",
+                    session_id, cached, input_total);
+            }
+            let input = input_total - cache_read;
             records.push(UsageRecord {
                 agent: Agent::Codex, provider: "openai".into(), model: model.clone(),
                 session_id: session_id.clone(), project: project.clone(),
@@ -138,5 +175,24 @@ mod tests {
         assert_eq!(rec.reasoning, 120);
         // shell called twice
         assert_eq!(s.tool_calls.iter().find(|(n,_)| n=="shell").unwrap().1, 2);
+    }
+
+    /// When cached_input_tokens > input_tokens (malformed/out-of-order data),
+    /// the adapter must clamp cache_read = input_total and set input = 0.
+    /// This preserves the invariant: input + cache_read == input_total (no inflation).
+    #[test]
+    fn codex_clamps_overcached_input_no_inflation() {
+        let a = CodexAdapter::new();
+        let r = SessionRef { agent: Agent::Codex, session_id: "cdx-overcached".into(),
+            path: PathBuf::from("tests/fixtures/codex_session_overcached.jsonl") };
+        let s = a.parse(&r).unwrap();
+        assert_eq!(s.records.len(), 1);
+        let rec = &s.records[0];
+        // input_tokens=500, cached=700: clamp cache_read=500, input=0
+        assert_eq!(rec.input, 0, "input should be 0 when cached > total_input");
+        assert_eq!(rec.cache_read, 500, "cache_read should be clamped to input_total");
+        // Invariant: input + cache_read == input_total (500)
+        assert_eq!(rec.input + rec.cache_read, 500,
+            "input + cache_read must equal input_total; no inflation");
     }
 }

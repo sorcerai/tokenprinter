@@ -13,6 +13,7 @@ pub struct Config {
     pub show_beads: bool,
     pub show_sparkline: bool,
     pub show_theatrics: bool,
+    pub timezone: String,
 }
 
 impl Default for Config {
@@ -25,6 +26,7 @@ impl Default for Config {
             queue_name: "Star_TSP654".into(),
             show_tools: true, show_productivity: true, show_beads: true,
             show_sparkline: true, show_theatrics: true,
+            timezone: "America/Chicago".into(),
         }
     }
 }
