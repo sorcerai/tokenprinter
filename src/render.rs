@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn long_project_path_does_not_overflow_48_cols() {
         let mut r = sample();
-        r.project = Some("/Users/aria/repos/reverie/.claude/worktrees/agent-a45f35040aa757f02".into());
+        r.project = Some("/home/dev/repos/example-project/.cache/worktrees/agent-000000000000".into());
         r.git_branch = Some("main".into());
         let s = render_text(&r);
         for line in s.lines() {
