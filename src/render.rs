@@ -77,7 +77,9 @@ pub fn render_bytes_with_qr(r: &Receipt, qr_data: Option<&str>) -> Vec<u8> {
             let raster = qr_raster(data);
             if !raster.is_empty() {
                 b.extend_from_slice(&raster);
-                b.extend_from_slice(b"\n\n"); // small feed after image
+                // Feed enough to clear the print-head→cutter gap (~1.5-2cm) so the
+                // QR fully advances past the blade before the cut (was \n\n → clipped QR).
+                b.extend_from_slice(b"\n\n\n\n\n\n");
             }
         }
     }
