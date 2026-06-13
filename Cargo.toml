@@ -23,5 +23,6 @@ dirs = "5"
 walkdir = "2"
 rusb = "0.9"
 wait-timeout = "0.2"
+qrcode = "0.14"
 
 [dev-dependencies]

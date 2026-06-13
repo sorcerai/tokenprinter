@@ -13,6 +13,7 @@ pub struct Config {
     pub show_beads: bool,
     pub show_sparkline: bool,
     pub show_theatrics: bool,
+    pub show_qr: bool,
     pub timezone: String,
 }
 
@@ -25,7 +26,7 @@ impl Default for Config {
             transport: "auto".into(),
             queue_name: "Star_TSP654".into(),
             show_tools: true, show_productivity: true, show_beads: true,
-            show_sparkline: true, show_theatrics: true,
+            show_sparkline: true, show_theatrics: true, show_qr: true,
             timezone: "America/Chicago".into(),
         }
     }

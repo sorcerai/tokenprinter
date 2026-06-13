@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::enrich::{beads::beads_stats, git::{current_branch, git_stats}};
 use crate::model::{Agent, GitStats, BeadsStats};
 use crate::pricing::PriceTable;
-use crate::render::{render_bytes, render_text};
+use crate::render::{render_bytes, render_bytes_with_qr, render_text};
 use crate::transport::{send, Mode};
 use anyhow::{anyhow, Context};
 use chrono_tz::Tz;
@@ -74,7 +74,13 @@ pub fn run() -> anyhow::Result<()> {
             if preview {
                 print!("{}", render_text(&receipt));
             } else {
-                send(&render_bytes(&receipt), Mode::parse(&cfg.transport), &cfg.queue_name)?;
+                let bytes = if cfg.show_qr {
+                    let qr_data = format!("file://{}", chosen.path.display());
+                    render_bytes_with_qr(&receipt, Some(&qr_data))
+                } else {
+                    render_bytes(&receipt)
+                };
+                send(&bytes, Mode::parse(&cfg.transport), &cfg.queue_name)?;
                 eprintln!("printed {} receipt for {}", ag.label(), receipt.session_name);
             }
         }
