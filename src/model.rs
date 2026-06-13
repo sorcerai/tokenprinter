@@ -107,6 +107,9 @@ pub struct Receipt {
     pub git: GitStats,
     pub beads: BeadsStats,
     pub sparkline: Vec<u8>, // 0..=7 bucket heights
+    /// When true, the receipt was triggered by a pre-compaction hook.
+    /// Renderers may show a "PRE-COMPACTION MEMORIAL" sub-header line.
+    pub precompact: bool,
 }
 
 #[cfg(test)]

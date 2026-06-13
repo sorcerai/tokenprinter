@@ -2,7 +2,91 @@ use crate::model::*;
 
 const W: usize = 48;
 
-fn rule(c: char) -> String { std::iter::repeat(c).take(W).collect() }
+/// Build a Star Line Mode raster bit-image for `data` encoded as a QR code.
+///
+/// Command layout emitted:
+///   ESC GS S  = [0x1b, 0x1d, 0x53]
+///   m         = 0x01  (raster mode)
+///   xL, xH   = number of BYTES per dot-row (ceil(width_dots / 8)), little-endian 16-bit
+///   yL, yH   = number of dot-rows (height_dots), little-endian 16-bit
+///   <data>    = bitmap bytes, row-major, MSB = leftmost dot, 1 = black module
+///
+/// Each QR module is rendered as an N×N block of dots (N=4) for scannability.
+/// Returns an empty Vec if encoding fails (e.g. data too large for QR).
+pub fn qr_raster(data: &str) -> Vec<u8> {
+    let code = match qrcode::QrCode::new(data.as_bytes()) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    const N: usize = 4; // dot-block size per QR module
+    let modules = code.width();
+    let dot_size = modules * N;
+
+    // bytes_per_row: ceil(dot_size / 8)
+    let bytes_per_row = dot_size.div_ceil(8);
+    let height_dots = dot_size;
+
+    // Build the bitmap: row-major, MSB = leftmost dot, 1 = black.
+    let colors = code.to_colors();
+    let mut bitmap: Vec<u8> = Vec::with_capacity(bytes_per_row * height_dots);
+
+    for dot_row in 0..height_dots {
+        let module_row = dot_row / N;
+        let mut row_bytes = vec![0u8; bytes_per_row];
+        for dot_col in 0..dot_size {
+            let module_col = dot_col / N;
+            let module_idx = module_row * modules + module_col;
+            let is_dark = colors[module_idx] == qrcode::Color::Dark;
+            if is_dark {
+                let byte_idx = dot_col / 8;
+                let bit = 7 - (dot_col % 8);
+                row_bytes[byte_idx] |= 1 << bit;
+            }
+        }
+        bitmap.extend_from_slice(&row_bytes);
+    }
+
+    // Assemble the Star Line raster command.
+    let x_l = (bytes_per_row & 0xFF) as u8;
+    let x_h = ((bytes_per_row >> 8) & 0xFF) as u8;
+    let y_l = (height_dots & 0xFF) as u8;
+    let y_h = ((height_dots >> 8) & 0xFF) as u8;
+
+    let mut out: Vec<u8> = Vec::with_capacity(7 + bitmap.len());
+    out.extend_from_slice(&[0x1b, 0x1d, 0x53]); // ESC GS S
+    out.push(0x01);                               // mode = 1 (raster)
+    out.push(x_l);
+    out.push(x_h);
+    out.push(y_l);
+    out.push(y_h);
+    out.extend_from_slice(&bitmap);
+    out
+}
+
+/// Same as `render_bytes` but inserts a QR raster block after the text body and before
+/// the final feed+cut when `qr_data` is `Some(&non_empty_str)` and `qr_raster` succeeds.
+pub fn render_bytes_with_qr(r: &Receipt, qr_data: Option<&str>) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&[0x1b, 0x40]); // ESC @ init
+    b.extend_from_slice(render_text(r).as_bytes());
+    b.extend_from_slice(b"\n\n\n");
+
+    if let Some(data) = qr_data {
+        if !data.is_empty() {
+            let raster = qr_raster(data);
+            if !raster.is_empty() {
+                b.extend_from_slice(&raster);
+                b.extend_from_slice(b"\n\n"); // small feed after image
+            }
+        }
+    }
+
+    b.extend_from_slice(&[0x1b, 0x64, 0x02]); // ESC d 2 full cut
+    b
+}
+
+fn rule(c: char) -> String { std::iter::repeat_n(c, W).collect() }
 fn center(s: &str) -> String {
     let n = s.chars().count();
     if n >= W { return s.chars().take(W).collect(); }
@@ -33,10 +117,10 @@ fn commafy(n: u64) -> String {
     }
     out.chars().rev().collect()
 }
-fn money(v: f64) -> String { format!("${:.2}", v) }
+fn money(v: f64) -> String { format!("${v:.2}") }
 fn dur(secs: i64) -> String {
     let h = secs / 3600; let m = (secs % 3600) / 60; let s = secs % 60;
-    format!("{:01}h {:02}m {:02}s", h, m, s)
+    format!("{h:01}h {m:02}m {s:02}s")
 }
 const SPARK: [char; 8] = ['▁','▁','▂','▃','▅','▆','▇','█'];
 
@@ -47,6 +131,9 @@ pub fn render_text(r: &Receipt) -> String {
     push(&mut o, center(&r.agent.provider().to_uppercase()));
     push(&mut o, rule('='));
     push(&mut o, center("TOKEN PRINTER"));
+    if r.precompact {
+        push(&mut o, center("PRE-COMPACTION MEMORIAL"));
+    }
     push(&mut o, rule('='));
     push(&mut o, lr(" Agent", &format!("{} ", r.agent.label())));
     push(&mut o, lr(" Location", &format!("{} ", r.location)));
@@ -68,23 +155,23 @@ pub fn render_text(r: &Receipt) -> String {
         push(&mut o, lr("   Cache write", &format!("{} ", commafy(m.cache_write))));
         push(&mut o, lr("   Cache read", &format!("{} ", commafy(m.cache_read))));
         let sub = match m.cost { Some(c)=>money(c), None=>"—".into() };
-        push(&mut o, lr("   Subtotal", &format!("{} ", sub)));
+        push(&mut o, lr("   Subtotal", &format!("{sub} ")));
         push(&mut o, String::new());
     }
 
     let calls: u32 = r.tools.iter().map(|(_,c)| *c).sum();
     push(&mut o, rule('-'));
-    push(&mut o, lr(" TOOL ACTIVITY", &format!("({} calls) ", calls)));
+    push(&mut o, lr(" TOOL ACTIVITY", &format!("({calls} calls) ")));
     push(&mut o, rule('-'));
     let maxc = r.tools.iter().map(|(_,c)| *c).max().unwrap_or(1).max(1);
     for (name, c) in r.tools.iter().take(6) {
         let bars = ((*c as f64 / maxc as f64) * 11.0).round() as usize;
-        let bar: String = std::iter::repeat('█').take(bars).collect();
-        push(&mut o, lr(&format!("   {:<10}{}", trunc(name,10), bar), &format!("{} ", c)));
+        let bar: String = std::iter::repeat_n('█', bars).collect();
+        push(&mut o, lr(&format!("   {:<10}{}", trunc(name,10), bar), &format!("{c} ")));
     }
     if r.tools.len() > 6 {
         let rest: u32 = r.tools.iter().skip(6).map(|(_,c)| *c).sum();
-        push(&mut o, lr(&format!("   +{} more", r.tools.len()-6), &format!("{} ", rest)));
+        push(&mut o, lr(&format!("   +{} more", r.tools.len()-6), &format!("{rest} ")));
     }
 
     push(&mut o, rule('-'));
@@ -104,7 +191,7 @@ pub fn render_text(r: &Receipt) -> String {
         push(&mut o, rule('-'));
         push(&mut o, " TOKENS OVER TIME".into());
         let spark: String = r.sparkline.iter().map(|&h| SPARK[(h as usize).min(7)]).collect();
-        push(&mut o, format!("   {}", spark));
+        push(&mut o, format!("   {spark}"));
     }
 
     push(&mut o, rule('='));
@@ -142,11 +229,11 @@ fn project_value(raw_path: &str, branch: Option<&str>) -> String {
         path.clone()
     } else {
         let tail: String = path_chars[path_chars.len().saturating_sub(path_budget.saturating_sub(1))..].iter().collect();
-        format!("…{}", tail)
+        format!("…{tail}")
     };
     match branch {
-        Some(b) => format!("{} ({}) ", truncated_path, b),
-        None => format!("{} ", truncated_path),
+        Some(b) => format!("{truncated_path} ({b}) "),
+        None => format!("{truncated_path} "),
     }
 }
 
@@ -156,21 +243,14 @@ fn trunc(s: &str, n: usize) -> String {
 fn short_path(p: &str) -> String {
     if let Some(home) = dirs::home_dir() {
         if let Some(h) = home.to_str() {
-            if let Some(stripped) = p.strip_prefix(h) { return format!("~{}", stripped); }
+            if let Some(stripped) = p.strip_prefix(h) { return format!("~{stripped}"); }
         }
     }
     p.to_string()
 }
 
 pub fn render_bytes(r: &Receipt) -> Vec<u8> {
-    let mut b = Vec::new();
-    b.extend_from_slice(&[0x1b, 0x40]); // ESC @ init
-    // body: render_text content as bytes (printer prints monospace ASCII; sparkline/box chars
-    // are UTF-8 and TSP654 Star Line passes them as raw bytes — acceptable for phase 1).
-    b.extend_from_slice(render_text(r).as_bytes());
-    b.extend_from_slice(b"\n\n\n");
-    b.extend_from_slice(&[0x1b, 0x64, 0x02]); // ESC d 2 full cut
-    b
+    render_bytes_with_qr(r, None)
 }
 
 #[cfg(test)]
@@ -194,6 +274,7 @@ mod tests {
             git: GitStats{files_changed:12,added:1204,removed:317,commits:3},
             beads: BeadsStats{opened:vec!["tp-14".into()],closed:vec!["tp-9".into()]},
             sparkline: vec![1,2,3,5,7,6,4,3,2,1],
+            precompact: false,
         }
     }
 
@@ -239,5 +320,20 @@ mod tests {
         let b = render_bytes(&sample());
         assert_eq!(&b[0..2], &[0x1b, 0x40]);          // ESC @
         assert_eq!(&b[b.len()-3..], &[0x1b,0x64,0x02]); // ESC d 2 cut
+    }
+
+    #[test]
+    fn qr_bytes_emit_raster_and_keep_init_and_cut() {
+        let r = sample();
+        let with = render_bytes_with_qr(&r, Some("file:///tmp/session.jsonl"));
+        assert_eq!(&with[0..2], &[0x1b, 0x40]);            // init
+        assert_eq!(&with[with.len()-3..], &[0x1b,0x64,0x02]); // cut
+        assert!(with.windows(3).any(|w| w == [0x1b,0x1d,0x53])); // raster cmd present
+        assert!(with.len() > render_bytes(&r).len());      // QR added bytes
+    }
+
+    #[test]
+    fn qr_raster_nonempty_for_normal_data() {
+        assert!(!qr_raster("https://example.com/x").is_empty());
     }
 }

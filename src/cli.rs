@@ -1,11 +1,12 @@
-use crate::adapters::{adapter_for, all_adapters, SessionRef};
+use crate::adapters::{adapter_for, all_adapters, Adapter, SessionRef};
 use crate::assemble::assemble_session;
 use crate::config::Config;
 use crate::enrich::{beads::beads_stats, git::{current_branch, git_stats}};
 use crate::model::{Agent, GitStats, BeadsStats};
 use crate::pricing::PriceTable;
-use crate::render::{render_bytes, render_text};
+use crate::render::{render_bytes, render_bytes_with_qr, render_text};
 use crate::transport::{send, Mode};
+use crate::triggers;
 use anyhow::{anyhow, Context};
 use chrono_tz::Tz;
 use clap::{Parser, Subcommand};
@@ -24,9 +25,64 @@ enum Cmd {
         #[arg(long)] last: bool,
         #[arg(long)] preview: bool,
         #[arg(long)] audit: bool,
+        /// Suppress the "printed … receipt" confirmation line on stderr.
+        #[arg(long)] quiet: bool,
+        /// Mark this as a pre-compaction snapshot (adds a PRE-COMPACTION MEMORIAL note to the receipt header).
+        #[arg(long)] precompact: bool,
     },
     Daily { #[arg(long)] date: Option<String>, #[arg(long)] preview: bool },
     Doctor,
+    /// Merge tokenprinter hook entries into a Claude settings JSON (idempotent).
+    InstallHooks {
+        /// Path to the Claude settings JSON file.
+        #[arg(long)] settings: Option<std::path::PathBuf>,
+        /// Path to the tokenprinter binary to embed in the hook command.
+        #[arg(long)] bin: Option<std::path::PathBuf>,
+    },
+    /// Write a launchd plist for the tokenprinter watch daemon (does NOT run launchctl).
+    InstallWatcher {
+        /// Destination path for the .plist file.
+        #[arg(long)] out: Option<std::path::PathBuf>,
+        /// launchd label for the service.
+        #[arg(long, default_value="com.tokenprinter.watch")] label: String,
+        /// Idle timeout in seconds (overrides config value).
+        #[arg(long)] idle: Option<u64>,
+    },
+    /// Watch codex/pi session directories and auto-print when idle.
+    Watch {
+        /// Do a single pass and exit (no sleep loop).
+        #[arg(long)] once: bool,
+        /// Print receipt as text to stdout instead of sending to printer.
+        #[arg(long)] preview: bool,
+        /// Override the idle threshold in seconds (default: from config).
+        #[arg(long)] idle: Option<u64>,
+    },
+}
+
+/// Reusable helper: parse → enrich → assemble → (preview? print text : send bytes).
+pub fn print_session(
+    adapter: &dyn Adapter,
+    sref: &SessionRef,
+    cfg: &Config,
+    prices: &PriceTable,
+    preview: bool,
+) -> anyhow::Result<()> {
+    let sd = adapter.parse(sref)?;
+    let (git, beads, branch) = enrich(&sd);
+    let mut receipt = assemble_session(&sd, prices, &cfg.location, git, beads);
+    if receipt.git_branch.is_none() { receipt.git_branch = branch; }
+    if preview {
+        print!("{}", render_text(&receipt));
+    } else {
+        let bytes = if cfg.show_qr {
+            let qr_data = format!("file://{}", sref.path.display());
+            render_bytes_with_qr(&receipt, Some(&qr_data))
+        } else {
+            render_bytes(&receipt)
+        };
+        send(&bytes, Mode::parse(&cfg.transport), &cfg.queue_name)?;
+    }
+    Ok(())
 }
 
 fn agent_from_str(s: &str) -> anyhow::Result<Agent> {
@@ -53,7 +109,7 @@ pub fn run() -> anyhow::Result<()> {
     let cfg = Config::load();
     let prices = load_prices();
     match cli.cmd {
-        Cmd::Print { agent, session, last, preview, audit } => {
+        Cmd::Print { agent, session, last, preview, audit, quiet, precompact } => {
             let ag = agent_from_str(&agent)?;
             let adapter = adapter_for(ag).ok_or_else(|| anyhow!("agent {agent} not supported in phase 1"))?;
             let refs = adapter.discover()?;
@@ -70,12 +126,21 @@ pub fn run() -> anyhow::Result<()> {
             let (git, beads, branch) = enrich(&sd);
             let mut receipt = assemble_session(&sd, &prices, &cfg.location, git, beads);
             if receipt.git_branch.is_none() { receipt.git_branch = branch; }
+            receipt.precompact = precompact;
 
             if preview {
                 print!("{}", render_text(&receipt));
             } else {
-                send(&render_bytes(&receipt), Mode::parse(&cfg.transport), &cfg.queue_name)?;
-                eprintln!("printed {} receipt for {}", ag.label(), receipt.session_name);
+                let bytes = if cfg.show_qr {
+                    let qr_data = format!("file://{}", chosen.path.display());
+                    render_bytes_with_qr(&receipt, Some(&qr_data))
+                } else {
+                    render_bytes(&receipt)
+                };
+                send(&bytes, Mode::parse(&cfg.transport), &cfg.queue_name)?;
+                if !quiet {
+                    eprintln!("printed {} receipt for {}", ag.label(), receipt.session_name);
+                }
             }
         }
         Cmd::Daily { date, preview } => {
@@ -87,6 +152,68 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         Cmd::Doctor => doctor(&prices)?,
+        Cmd::InstallHooks { settings, bin } => {
+            let settings_path = settings.unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".claude/settings.json")
+            });
+            let bin_path = bin
+                .map(|p| p.to_string_lossy().into_owned())
+                .or_else(|| std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "tokenprinter".to_string());
+
+            triggers::hooks::install_hooks(&settings_path, &bin_path)?;
+
+            let stop_cmd = format!(
+                "{bin_path} print --agent claude --session \"$CLAUDE_SESSION_ID\" --quiet"
+            );
+            let precompact_cmd = format!(
+                "{bin_path} print --agent claude --session \"$CLAUDE_SESSION_ID\" --precompact --quiet"
+            );
+            println!("Added hooks to: {}", settings_path.display());
+            println!("  Stop      → {stop_cmd}");
+            println!("  PreCompact→ {precompact_cmd}");
+            println!();
+            println!(
+                "NOTE: This modified your live Claude settings; remove the tokenprinter entries from {} to undo.",
+                settings_path.display()
+            );
+        }
+        Cmd::Watch { once, preview, idle } => {
+            let mut cfg2 = cfg.clone();
+            if let Some(s) = idle { cfg2.idle_seconds = s; }
+            crate::watch::watch_loop(once, preview, &cfg2, &prices)?;
+        }
+        Cmd::InstallWatcher { out, label, idle } => {
+            let cfg2 = Config::load();
+            let idle_seconds = idle.unwrap_or(cfg2.idle_seconds);
+            let out_path = out.unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join("Library/LaunchAgents/com.tokenprinter.watch.plist")
+            });
+            let bin_path = std::env::current_exe()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "tokenprinter".to_string());
+
+            let plist = triggers::launchd::launchd_plist(&bin_path, &label, idle_seconds);
+
+            if let Some(parent) = out_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("creating {}", parent.display()))?;
+                }
+            }
+            std::fs::write(&out_path, &plist)
+                .with_context(|| format!("writing plist to {}", out_path.display()))?;
+
+            println!("Wrote launchd plist to: {}", out_path.display());
+            println!();
+            println!("To start the watcher, run:");
+            println!("  launchctl load {}", out_path.display());
+        }
     }
     Ok(())
 }
@@ -250,8 +377,8 @@ pub fn audit_rows(sd: &crate::model::SessionData, prices: &PriceTable) -> Vec<Au
 
 fn print_audit_table(sd: &crate::model::SessionData, prices: &PriceTable) {
     let rows = audit_rows(sd, prices);
-    println!("{:<30} {:>10} {:>10} {:>12} {:>12} {:>14} {:>10} {}",
-        "model", "input", "output", "cache_write", "cache_read", "context_size", "cost", "flags");
+    println!("{:<30} {:>10} {:>10} {:>12} {:>12} {:>14} {:>10} flags",
+        "model", "input", "output", "cache_write", "cache_read", "context_size", "cost");
     println!("{}", "-".repeat(100));
     let mut total_input = 0u64;
     let mut total_output = 0u64;
@@ -260,7 +387,7 @@ fn print_audit_table(sd: &crate::model::SessionData, prices: &PriceTable) {
     let mut total_cost = 0f64;
     let mut any_cost = false;
     for r in &rows {
-        let cost_str = match r.cost { Some(c) => { any_cost = true; total_cost += c; format!("${:.4}", c) } None => "—".into() };
+        let cost_str = match r.cost { Some(c) => { any_cost = true; total_cost += c; format!("${c:.4}") } None => "—".into() };
         let flags = if r.overlap { "OVERLAP!" } else { "" };
         println!("{:<30} {:>10} {:>10} {:>12} {:>12} {:>14} {:>10} {}",
             r.model, r.input, r.output, r.cache_write, r.cache_read, r.context_size, cost_str, flags);
@@ -270,7 +397,7 @@ fn print_audit_table(sd: &crate::model::SessionData, prices: &PriceTable) {
         total_cr += r.cache_read;
     }
     println!("{}", "-".repeat(100));
-    let total_cost_str = if any_cost { format!("${:.4}", total_cost) } else { "—".into() };
+    let total_cost_str = if any_cost { format!("${total_cost:.4}") } else { "—".into() };
     println!("{:<30} {:>10} {:>10} {:>12} {:>12} {:>14} {:>10}",
         "TOTAL", total_input, total_output, total_cw, total_cr, "", total_cost_str);
 }

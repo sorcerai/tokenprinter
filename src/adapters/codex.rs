@@ -9,6 +9,12 @@ use std::path::PathBuf;
 
 pub struct CodexAdapter { root: PathBuf }
 
+impl Default for CodexAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CodexAdapter {
     pub fn new() -> Self {
         let root = dirs::home_dir().unwrap_or_default().join(".codex/sessions");
@@ -108,9 +114,8 @@ impl Adapter for CodexAdapter {
                 // Recompute last's total for comparison.
                 let last_total_approx = last.0 + last.2 + last.3;
                 if peak_tokens > 0 && last_total_approx < peak_tokens {
-                    eprintln!("warn: codex session '{}': last token_count event total ({}) is less \
-                        than peak seen ({}); using peak event instead",
-                        session_id, last_total_approx, peak_tokens);
+                    eprintln!("warn: codex session '{session_id}': last token_count event total ({last_total_approx}) is less \
+                        than peak seen ({peak_tokens}); using peak event instead");
                     let _ = last_tokens; // suppress unused warning
                     peak
                 } else {
@@ -124,9 +129,8 @@ impl Adapter for CodexAdapter {
             // (a) Clamp cache_read so input + cache_read == input_total always.
             let cache_read = cached.min(input_total);
             if cached > input_total {
-                eprintln!("warn: codex session '{}': cached_input_tokens ({}) > input_tokens ({}); \
-                    clamping cache_read to input_total to preserve bucket invariant",
-                    session_id, cached, input_total);
+                eprintln!("warn: codex session '{session_id}': cached_input_tokens ({cached}) > input_tokens ({input_total}); \
+                    clamping cache_read to input_total to preserve bucket invariant");
             }
             let input = input_total - cache_read;
             records.push(UsageRecord {

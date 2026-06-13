@@ -8,3 +8,5 @@ pub mod transport;
 pub mod config;
 pub mod cli;
 pub mod proc;
+pub mod triggers;
+pub mod watch;
