@@ -1,0 +1,28 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock        # binary crate: keep? -> commit later when Cargo.toml exists
+
+# Machine-specific / local config (contains absolute home paths)
+.mcp.json
+
+# Secrets / credentials — never commit
+.env
+.env.*
+*.pem
+*.key
+auth.json
+**/secrets.*
+config.local.toml
+
+# Local tokenprinter runtime config (lives in ~/.config normally; ignore if copied here)
+/config.toml
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Test fixtures may contain real session data — keep redacted copies only
+/tests/fixtures/raw/
