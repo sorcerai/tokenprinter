@@ -1,13 +1,13 @@
 //! OpenRouter spend-receipt source.
 //!
 //! Fetches data from three endpoints:
-//!   - `/credits`   (required) — total credits purchased and total usage
+//!   - `/credits`   (required) — total credits purchased and total usage (lifetime)
 //!   - `/key`       (required) — key metadata including daily/weekly/monthly usage
 //!   - `/activity`  (best-effort) — per-model breakdown; on 403 or parse error, silently skipped.
-//!     NOTE: The /activity success shape is unverified (management keys only). We parse
-//!     defensively: if `data` is an array of objects, we pull optional fields `model` (string),
-//!     `usage` (f64 cost), and token counts trying both `prompt_tokens`/`completion_tokens` and
-//!     `tokens_prompt`/`tokens_completion`. Any mismatch or error returns an empty vec.
+//!     Requires a management key. Returns daily rows (~30 days × models × endpoints).
+//!     We aggregate by `model`, summing prompt_tokens, completion_tokens, and usage (USD cost)
+//!     across all rows, then sort by total cost descending.
+//!     NOTE: /activity covers the last ~30 days; /credits total_usage is lifetime.
 
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
@@ -142,12 +142,22 @@ pub fn parse_key(body: &str) -> anyhow::Result<KeyInfo> {
     Ok(KeyInfo { label, usage_daily, usage_weekly, usage_monthly, limit_remaining })
 }
 
-/// Parse the /activity response body (best-effort; returns empty on any error or mismatch).
-/// NOTE: Success shape is unverified (requires management key). We parse defensively:
-///   data is expected to be an array of objects with optional fields:
-///   model (string), usage (f64 cost), and token counts via
-///   `prompt_tokens`/`completion_tokens` or `tokens_prompt`/`tokens_completion`.
+/// Parse the /activity response body and aggregate by model (best-effort).
+///
+/// The real shape (management key only) is:
+///   `{"data": [...rows]}` where each row has:
+///   - `model`              (string)  — e.g. "anthropic/claude-sonnet-4.6"
+///   - `prompt_tokens`      (u64)     — input tokens for this day/endpoint slice
+///   - `completion_tokens`  (u64)     — output tokens
+///   - `usage`              (f64)     — USD cost
+///     (plus date, model_permaslug, endpoint_id, provider_name, etc. — ignored)
+///
+/// We aggregate: for each unique `model`, sum prompt_tokens, completion_tokens, usage across
+/// all ~30 days × endpoints rows. Result is sorted by total cost descending.
+/// Returns an empty Vec on any error, missing `data`, non-array body, or 403 response.
 pub fn parse_activity(body: &str) -> Vec<ModelRow> {
+    use std::collections::HashMap;
+
     let v: Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(_) => return vec![],
@@ -156,25 +166,41 @@ pub fn parse_activity(body: &str) -> Vec<ModelRow> {
         Some(a) => a,
         None => return vec![],
     };
-    let mut rows = Vec::new();
+
+    // Accumulate: model → (prompt_tokens, completion_tokens, cost)
+    let mut agg: HashMap<String, (u64, u64, f64)> = HashMap::new();
+
     for item in arr {
         let obj = match item.as_object() {
             Some(o) => o,
             None => continue,
         };
-        let model = obj.get("model").and_then(|m| m.as_str()).unwrap_or("unknown").to_string();
+        // Skip rows with no model name
+        let model = match obj.get("model").and_then(|m| m.as_str()) {
+            Some(m) if !m.is_empty() => m.to_string(),
+            _ => continue,
+        };
         let cost = obj.get("usage").and_then(|u| u.as_f64()).unwrap_or(0.0);
-        // Try both token field naming conventions
-        let prompt_tokens = obj
-            .get("prompt_tokens")
-            .or_else(|| obj.get("tokens_prompt"))
-            .and_then(|t| t.as_u64());
-        let completion_tokens = obj
-            .get("completion_tokens")
-            .or_else(|| obj.get("tokens_completion"))
-            .and_then(|t| t.as_u64());
-        rows.push((model, prompt_tokens, completion_tokens, cost));
+        let pt = obj.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+        let ct = obj.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+
+        let entry = agg.entry(model).or_insert((0, 0, 0.0));
+        entry.0 += pt;
+        entry.1 += ct;
+        entry.2 += cost;
     }
+
+    let mut rows: Vec<ModelRow> = agg
+        .into_iter()
+        .map(|(model, (pt, ct, cost))| {
+            let prompt = if pt > 0 { Some(pt) } else { None };
+            let completion = if ct > 0 { Some(ct) } else { None };
+            (model, prompt, completion, cost)
+        })
+        .collect();
+
+    // Sort by cost descending
+    rows.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
     rows
 }
 
@@ -197,23 +223,52 @@ pub fn render_statement_text(stmt: &OpenRouterStatement, when: DateTime<Utc>) ->
     push(&mut o, lr(" Key", &format!("{} ", trunc_pub(&stmt.key_label, 28))));
     push(&mut o, lr(" Date", &format!("{} ", when.format("%Y-%m-%d %H:%M:%S"))));
 
+    // MODEL BREAKDOWN — aggregated from /activity (last ~30 days).
+    // Note: /activity covers ~last 30 days; CREDITS total_usage below is lifetime.
     if !stmt.models.is_empty() {
         push(&mut o, rule('-'));
-        push(&mut o, " MODEL BREAKDOWN".into());
+        push(&mut o, " MODEL BREAKDOWN  (last 30 days)".into());
         push(&mut o, rule('-'));
-        for (model, pt, ct, cost) in &stmt.models {
-            push(&mut o, format!("  {}", trunc_pub(model, 46)));
-            if let Some(p) = pt {
-                push(&mut o, lr("    Prompt tokens", &format!("{} ", commafy(*p))));
+        let top: Vec<_> = stmt.models.iter().take(10).collect();
+        let rest = stmt.models.len().saturating_sub(10);
+        let rest_cost: f64 = stmt.models.iter().skip(10).map(|(_, _, _, c)| c).sum();
+        for (model, pt, ct, cost) in &top {
+            // Model name: truncate to leave room for cost on the right
+            // Name col: 48 - 1(space) - cost_width. Cost " $XX.XX" ≤ 8 chars → name ≤ 39.
+            let cost_str = format!("{} ", money(*cost));
+            let name_budget = 48usize
+                .saturating_sub(1) // leading space
+                .saturating_sub(cost_str.chars().count());
+            let name = trunc_pub(model, name_budget);
+            push(&mut o, lr(&format!(" {name}"), &cost_str));
+            // Compact tokens line: "  P: 1,234 + C: 567"
+            match (pt, ct) {
+                (Some(p), Some(c)) => {
+                    let tok_line = format!("  {} + {} tok", commafy(*p), commafy(*c));
+                    // Truncate if needed (≤48 chars)
+                    let tok_trunc: String = tok_line.chars().take(48).collect();
+                    push(&mut o, tok_trunc);
+                }
+                (Some(p), None) => {
+                    let tok_line = format!("  {} prompt tok", commafy(*p));
+                    let tok_trunc: String = tok_line.chars().take(48).collect();
+                    push(&mut o, tok_trunc);
+                }
+                (None, Some(c)) => {
+                    let tok_line = format!("  {} completion tok", commafy(*c));
+                    let tok_trunc: String = tok_line.chars().take(48).collect();
+                    push(&mut o, tok_trunc);
+                }
+                (None, None) => {}
             }
-            if let Some(c) = ct {
-                push(&mut o, lr("    Completion tokens", &format!("{} ", commafy(*c))));
-            }
-            push(&mut o, lr("    Cost", &format!("{} ", money(*cost))));
+        }
+        if rest > 0 {
+            push(&mut o, lr(&format!("  +{rest} more"), &format!("{} ", money(rest_cost))));
         }
     }
 
     push(&mut o, rule('-'));
+    // NOTE: /activity covers last ~30 days; CREDITS total_usage below is lifetime.
     push(&mut o, " CREDITS".into());
     push(&mut o, rule('-'));
     push(&mut o, lr("   Total credits", &format!("{} ", money(stmt.total_credits))));
@@ -291,19 +346,39 @@ mod tests {
         }
     }"#;
 
+    // Verified real /activity field names (management key, ~30 days of daily rows).
+    // Each row: model, prompt_tokens, completion_tokens, usage (USD cost), plus
+    // date, model_permaslug, endpoint_id, provider_name, byok_usage_inference,
+    // byok_requests, reasoning_tokens, requests — all ignored by parse_activity.
     const ACTIVITY_MGMT_JSON: &str = r#"{
         "data": [
             {
+                "date": "2026-06-12 00:00:00",
+                "model_permaslug": "anthropic/claude-opus-4-20260117",
                 "model": "anthropic/claude-opus-4",
+                "provider_name": "Anthropic",
+                "endpoint_id": "ep-1",
                 "usage": 5.12,
                 "prompt_tokens": 10000,
-                "completion_tokens": 500
+                "completion_tokens": 500,
+                "reasoning_tokens": 0,
+                "requests": 10,
+                "byok_usage_inference": 0,
+                "byok_requests": 0
             },
             {
+                "date": "2026-06-12 00:00:00",
+                "model_permaslug": "openai/gpt-4o-2024-11-20",
                 "model": "openai/gpt-4o",
+                "provider_name": "OpenAI",
+                "endpoint_id": "ep-2",
                 "usage": 1.50,
-                "tokens_prompt": 3000,
-                "tokens_completion": 200
+                "prompt_tokens": 3000,
+                "completion_tokens": 200,
+                "reasoning_tokens": 0,
+                "requests": 5,
+                "byok_usage_inference": 0,
+                "byok_requests": 0
             }
         ]
     }"#;
@@ -341,19 +416,82 @@ mod tests {
 
     #[test]
     fn parse_activity_management_key_shape() {
+        // Single-row-per-model fixture — verifies field extraction and cost-desc sort.
         let rows = parse_activity(ACTIVITY_MGMT_JSON);
         assert_eq!(rows.len(), 2);
+        // Sorted by cost descending: claude-opus-4 ($5.12) before gpt-4o ($1.50)
         let (model, pt, ct, cost) = &rows[0];
         assert_eq!(model, "anthropic/claude-opus-4");
         assert_eq!(*pt, Some(10000));
         assert_eq!(*ct, Some(500));
         assert!((cost - 5.12).abs() < 1e-9);
-        // Second row uses tokens_prompt / tokens_completion naming
         let (model2, pt2, ct2, cost2) = &rows[1];
         assert_eq!(model2, "openai/gpt-4o");
         assert_eq!(*pt2, Some(3000));
         assert_eq!(*ct2, Some(200));
         assert!((cost2 - 1.50).abs() < 1e-9);
+    }
+
+    /// Fixture: 4 rows across 2 days and 2 models — tests aggregation and sort.
+    const ACTIVITY_AGG_JSON: &str = r#"{
+        "data": [
+            {
+                "date": "2026-06-11 00:00:00",
+                "model": "anthropic/claude-sonnet-4.6",
+                "endpoint_id": "ep-a",
+                "usage": 3.00,
+                "prompt_tokens": 20000,
+                "completion_tokens": 800,
+                "requests": 4
+            },
+            {
+                "date": "2026-06-12 00:00:00",
+                "model": "anthropic/claude-sonnet-4.6",
+                "endpoint_id": "ep-a",
+                "usage": 5.50,
+                "prompt_tokens": 35000,
+                "completion_tokens": 1200,
+                "requests": 7
+            },
+            {
+                "date": "2026-06-11 00:00:00",
+                "model": "openai/gpt-4o",
+                "endpoint_id": "ep-b",
+                "usage": 1.00,
+                "prompt_tokens": 4000,
+                "completion_tokens": 300,
+                "requests": 2
+            },
+            {
+                "date": "2026-06-12 00:00:00",
+                "model": "openai/gpt-4o",
+                "endpoint_id": "ep-b",
+                "usage": 0.75,
+                "prompt_tokens": 3000,
+                "completion_tokens": 250,
+                "requests": 2
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn parse_activity_aggregates_by_model() {
+        let rows = parse_activity(ACTIVITY_AGG_JSON);
+        // 4 raw rows → 2 models
+        assert_eq!(rows.len(), 2, "expected 2 aggregated models");
+
+        // Sorted by cost descending: claude-sonnet-4.6 ($8.50) before gpt-4o ($1.75)
+        let (model0, pt0, ct0, cost0) = &rows[0];
+        assert_eq!(model0, "anthropic/claude-sonnet-4.6");
+        assert_eq!(*pt0, Some(20000 + 35000), "prompt tokens should be summed");
+        assert_eq!(*ct0, Some(800 + 1200), "completion tokens should be summed");
+        assert!((cost0 - 8.50).abs() < 1e-9, "cost should be summed: got {cost0}");
+
+        let (model1, pt1, ct1, cost1) = &rows[1];
+        assert_eq!(model1, "openai/gpt-4o");
+        assert_eq!(*pt1, Some(4000 + 3000));
+        assert_eq!(*ct1, Some(300 + 250));
+        assert!((cost1 - 1.75).abs() < 1e-9, "cost should be summed: got {cost1}");
     }
 
     #[test]
@@ -413,12 +551,25 @@ mod tests {
     #[test]
     fn render_text_with_models_fits_48_cols() {
         let mut stmt = sample_statement();
+        // 12 models to exercise top-10 cap and "+N more" line
         stmt.models = vec![
-            ("anthropic/claude-opus-4-5-20251101".into(), Some(100_000), Some(5_000), 1.23),
-            ("openai/gpt-4o".into(), None, None, 0.45),
+            ("anthropic/claude-sonnet-4.6".into(), Some(55_000), Some(2_000), 8.50),
+            ("anthropic/claude-opus-4-5-20251101".into(), Some(100_000), Some(5_000), 3.23),
+            ("openai/gpt-4o".into(), None, None, 1.45),
+            ("openai/gpt-4o-mini".into(), Some(8_000), None, 0.90),
+            ("meta-llama/llama-3-70b".into(), Some(5_000), Some(200), 0.50),
+            ("google/gemini-pro".into(), Some(3_000), Some(150), 0.30),
+            ("mistralai/mistral-7b".into(), Some(2_000), Some(100), 0.15),
+            ("cohere/command-r".into(), Some(1_000), Some(50), 0.10),
+            ("anthropic/claude-haiku-3.5".into(), Some(500), Some(25), 0.08),
+            ("perplexity/sonar".into(), Some(300), Some(10), 0.05),
+            ("qwen/qwen2-72b".into(), Some(200), Some(5), 0.03),
+            ("deepseek/deepseek-r1".into(), Some(100), Some(2), 0.01),
         ];
         let s = render_statement_text(&stmt, sample_when());
-        assert!(s.contains("MODEL BREAKDOWN"));
+        assert!(s.contains("MODEL BREAKDOWN"), "should contain MODEL BREAKDOWN");
+        assert!(s.contains("last 30 days"), "should mention last 30 days");
+        assert!(s.contains("+2 more"), "should have +2 more line for models beyond top 10");
         for line in s.lines() {
             assert!(
                 line.chars().count() <= 48,
