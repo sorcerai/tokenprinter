@@ -1,4 +1,4 @@
-use crate::adapters::{adapter_for, all_adapters, SessionRef};
+use crate::adapters::{adapter_for, all_adapters, Adapter, SessionRef};
 use crate::assemble::assemble_session;
 use crate::config::Config;
 use crate::enrich::{beads::beads_stats, git::{current_branch, git_stats}};
@@ -48,6 +48,41 @@ enum Cmd {
         /// Idle timeout in seconds (overrides config value).
         #[arg(long)] idle: Option<u64>,
     },
+    /// Watch codex/pi session directories and auto-print when idle.
+    Watch {
+        /// Do a single pass and exit (no sleep loop).
+        #[arg(long)] once: bool,
+        /// Print receipt as text to stdout instead of sending to printer.
+        #[arg(long)] preview: bool,
+        /// Override the idle threshold in seconds (default: from config).
+        #[arg(long)] idle: Option<u64>,
+    },
+}
+
+/// Reusable helper: parse → enrich → assemble → (preview? print text : send bytes).
+pub fn print_session(
+    adapter: &dyn Adapter,
+    sref: &SessionRef,
+    cfg: &Config,
+    prices: &PriceTable,
+    preview: bool,
+) -> anyhow::Result<()> {
+    let sd = adapter.parse(sref)?;
+    let (git, beads, branch) = enrich(&sd);
+    let mut receipt = assemble_session(&sd, prices, &cfg.location, git, beads);
+    if receipt.git_branch.is_none() { receipt.git_branch = branch; }
+    if preview {
+        print!("{}", render_text(&receipt));
+    } else {
+        let bytes = if cfg.show_qr {
+            let qr_data = format!("file://{}", sref.path.display());
+            render_bytes_with_qr(&receipt, Some(&qr_data))
+        } else {
+            render_bytes(&receipt)
+        };
+        send(&bytes, Mode::parse(&cfg.transport), &cfg.queue_name)?;
+    }
+    Ok(())
 }
 
 fn agent_from_str(s: &str) -> anyhow::Result<Agent> {
@@ -146,6 +181,11 @@ pub fn run() -> anyhow::Result<()> {
                 "NOTE: This modified your live Claude settings; remove the tokenprinter entries from {} to undo.",
                 settings_path.display()
             );
+        }
+        Cmd::Watch { once, preview, idle } => {
+            let mut cfg2 = cfg.clone();
+            if let Some(s) = idle { cfg2.idle_seconds = s; }
+            crate::watch::watch_loop(once, preview, &cfg2, &prices)?;
         }
         Cmd::InstallWatcher { out, label, idle } => {
             let cfg2 = Config::load();
