@@ -26,3 +26,6 @@ config.local.toml
 
 # Test fixtures may contain real session data — keep redacted copies only
 /tests/fixtures/raw/
+
+# AI design/plan scaffolding — keep local, do not publish
+docs/superpowers/
