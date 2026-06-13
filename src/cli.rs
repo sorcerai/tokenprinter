@@ -140,9 +140,12 @@ fn doctor(prices: &PriceTable) -> anyhow::Result<()> {
     println!("tokenprinter doctor");
     println!("  config: {}", Config::path().display());
     // tool availability
-    for (name, args) in [("lp", vec!["-v"]), ("git", vec!["--version"]), ("bd", vec!["--version"])] {
+    let cups_ok = std::process::Command::new("lpstat").args(["-r"]).output()
+        .map(|o| o.status.success()).unwrap_or(false);
+    println!("  {:<8} {}", "lp/cups", if cups_ok {"ok"} else {"MISSING"});
+    for (name, args) in [("git", vec!["--version"]), ("bd", vec!["--version"])] {
         let ok = std::process::Command::new(name).args(&args).output().map(|o| o.status.success()).unwrap_or(false);
-        println!("  {:<5} {}", name, if ok {"ok"} else {"MISSING"});
+        println!("  {:<8} {}", name, if ok {"ok"} else {"MISSING"});
     }
     // adapters + price drift
     for adapter in all_adapters() {

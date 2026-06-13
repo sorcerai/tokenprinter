@@ -44,7 +44,7 @@ pub fn render_text(r: &Receipt) -> String {
     push(&mut o, lr(" Location", &format!("{} ", r.location)));
     push(&mut o, lr(" Session", &format!("{} ", trunc(&r.session_name, 32))));
     if let Some(p) = &r.project {
-        let pb = match &r.git_branch { Some(b)=>format!("{} ({}) ", short_path(p), b), None=>format!("{} ", short_path(p)) };
+        let pb = project_value(p, r.git_branch.as_deref());
         push(&mut o, lr(" Project", &pb));
     }
     push(&mut o, lr(" Date", &format!("{} ", r.when.format("%Y-%m-%d %H:%M:%S"))));
@@ -118,6 +118,30 @@ pub fn render_text(r: &Receipt) -> String {
     o
 }
 
+/// Build the right-hand value for the Project line such that `lr(" Project", value)` fits W cols.
+/// Keeps the tail of the path and prefixes with `…` when truncated.
+fn project_value(raw_path: &str, branch: Option<&str>) -> String {
+    let path = short_path(raw_path);
+    // " Project" = 8 chars, 1 space separator, value chars + trailing space
+    // lr produces W-wide only when l+r < W; safe budget for the right value:
+    let label_len = " Project".chars().count(); // 8
+    // branch suffix: " (branch) " including trailing space
+    let branch_suffix_len = branch.map(|b| 3 + b.chars().count() + 2).unwrap_or(1); // " (" + b + ") " or just " "
+    // budget for path chars = W - label_len - 1(space) - branch_suffix_len
+    let path_budget = W.saturating_sub(label_len + 1 + branch_suffix_len);
+    let path_chars: Vec<char> = path.chars().collect();
+    let truncated_path = if path_chars.len() <= path_budget {
+        path.clone()
+    } else {
+        let tail: String = path_chars[path_chars.len().saturating_sub(path_budget.saturating_sub(1))..].iter().collect();
+        format!("…{}", tail)
+    };
+    match branch {
+        Some(b) => format!("{} ({}) ", truncated_path, b),
+        None => format!("{} ", truncated_path),
+    }
+}
+
 fn trunc(s: &str, n: usize) -> String {
     if s.chars().count() <= n { s.to_string() } else { s.chars().take(n.saturating_sub(1)).collect::<String>() + "…" }
 }
@@ -177,6 +201,17 @@ mod tests {
         assert!(s.contains("tp-14"));
         // every line <= 48 cols
         for line in s.lines() { assert!(line.chars().count() <= 48, "too wide: {line:?}"); }
+    }
+
+    #[test]
+    fn long_project_path_does_not_overflow_48_cols() {
+        let mut r = sample();
+        r.project = Some("/Users/aria/repos/reverie/.claude/worktrees/agent-a45f35040aa757f02".into());
+        r.git_branch = Some("main".into());
+        let s = render_text(&r);
+        for line in s.lines() {
+            assert!(line.chars().count() <= 48, "line too wide ({} chars): {line:?}", line.chars().count());
+        }
     }
 
     #[test]

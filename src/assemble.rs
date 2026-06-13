@@ -107,8 +107,8 @@ mod tests {
             agent: Agent::Claude, session_id: "s".into(), project: Some("/tmp/x".into()),
             git_branch: Some("main".into()), started_at: start, ended_at: start + Duration::minutes(60),
             records: vec![
-                rec("claude-opus-4-8", 1_000_000, 0, 0, 0, None, 0),   // $15
-                rec("claude-opus-4-8", 0, 1_000_000, 0, 0, None, 30),  // $75
+                rec("claude-opus-4-8", 1_000_000, 0, 0, 0, None, 0),   // $5
+                rec("claude-opus-4-8", 0, 1_000_000, 0, 0, None, 30),  // $25
                 rec("claude-sonnet-4-6", 1_000_000, 0, 0, 0, None, 60),// $3
             ],
             tool_calls: vec![("Edit".into(),3),("Bash".into(),1)], turns: 3,
@@ -118,9 +118,9 @@ mod tests {
             GitStats{files_changed:2,added:10,removed:1,commits:1},
             BeadsStats{opened:vec!["tp-1".into()],closed:vec![]});
         assert_eq!(r.per_model.len(), 2);
-        assert!((r.total_cost.unwrap() - 93.0).abs() < 1e-6, "{:?}", r.total_cost);
+        assert!((r.total_cost.unwrap() - 33.0).abs() < 1e-6, "{:?}", r.total_cost);
         assert_eq!(r.total_tokens, 3_000_000);
-        assert!((r.burn_rate_per_hr.unwrap() - 93.0).abs() < 1e-3); // 60-min session
+        assert!((r.burn_rate_per_hr.unwrap() - 33.0).abs() < 1e-3); // 60-min session
         assert_eq!(r.tools[0].0, "Edit"); // sorted desc by count
         assert_eq!(r.git.commits, 1);
         assert_eq!(r.beads.opened, vec!["tp-1"]);
