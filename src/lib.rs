@@ -7,3 +7,4 @@ pub mod render;
 pub mod transport;
 pub mod config;
 pub mod cli;
+pub mod proc;

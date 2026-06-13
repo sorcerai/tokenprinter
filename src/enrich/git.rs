@@ -1,4 +1,5 @@
 use crate::model::GitStats;
+use crate::proc::output_with_timeout;
 use chrono::{DateTime, Utc};
 use std::path::Path;
 use std::process::Command;
@@ -12,15 +13,19 @@ pub fn git_stats(dir: &Path, start: DateTime<Utc>, end: DateTime<Utc>) -> anyhow
     let until = end.to_rfc3339();
 
     // commit count
-    let out = Command::new("git").current_dir(dir)
-        .args(["log", "--since", &since, "--until", &until, "--pretty=%H"])
-        .output()?;
+    let out = output_with_timeout(
+        { let mut c = Command::new("git"); c.current_dir(dir)
+            .args(["log", "--since", &since, "--until", &until, "--pretty=%H"]); c },
+        10,
+    )?;
     g.commits = String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.is_empty()).count() as u32;
 
     // diffstat across those commits
-    let out = Command::new("git").current_dir(dir)
-        .args(["log", "--since", &since, "--until", &until, "--pretty=tformat:", "--numstat"])
-        .output()?;
+    let out = output_with_timeout(
+        { let mut c = Command::new("git"); c.current_dir(dir)
+            .args(["log", "--since", &since, "--until", &until, "--pretty=tformat:", "--numstat"]); c },
+        10,
+    )?;
     let text = String::from_utf8_lossy(&out.stdout);
     let mut files = std::collections::HashSet::new();
     for line in text.lines() {
@@ -37,13 +42,16 @@ pub fn git_stats(dir: &Path, start: DateTime<Utc>, end: DateTime<Utc>) -> anyhow
 }
 
 fn is_in_worktree(dir: &Path) -> bool {
-    Command::new("git").current_dir(dir).args(["rev-parse","--is-inside-work-tree"])
-        .output().map(|o| o.status.success()).unwrap_or(false)
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir).args(["rev-parse","--is-inside-work-tree"]);
+    output_with_timeout(cmd, 10).map(|o| o.status.success()).unwrap_or(false)
 }
 
 /// Current branch name, if any.
 pub fn current_branch(dir: &Path) -> Option<String> {
-    let out = Command::new("git").current_dir(dir).args(["rev-parse","--abbrev-ref","HEAD"]).output().ok()?;
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir).args(["rev-parse","--abbrev-ref","HEAD"]);
+    let out = output_with_timeout(cmd, 10).ok()?;
     if !out.status.success() { return None; }
     let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if b.is_empty() { None } else { Some(b) }

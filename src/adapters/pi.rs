@@ -74,10 +74,15 @@ impl Adapter for PiAdapter {
                 let cache_write = u(usage, "cache_creation_input_tokens");
                 let cache_read = u(usage, "cache_read_input_tokens");
                 let cost = v.get("cost").and_then(|c| c.as_f64());
+                // Timestamp fallback: prefer last-seen ts, then first_ts, then Utc::now.
+                let rec_ts = ts
+                    .or(last_ts)
+                    .or(first_ts)
+                    .unwrap_or_else(Utc::now);
                 records.push(UsageRecord {
                     agent: Agent::Pi, provider: "multi".into(), model,
                     session_id: session_id.clone(), project: project.clone(),
-                    timestamp: ts.unwrap_or_else(Utc::now),
+                    timestamp: rec_ts,
                     input, output, cache_write, cache_read, reasoning: 0,
                     context_size: input + cache_write + cache_read,
                     cache_write_ttl: CacheTtl::FiveMin, cost,

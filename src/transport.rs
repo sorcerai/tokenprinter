@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context};
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::Duration;
+use wait_timeout::ChildExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode { Auto, Cups, Usb }
@@ -30,11 +32,22 @@ fn send_cups(bytes: &[u8], queue: &str) -> anyhow::Result<()> {
         .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped())
         .spawn().context("spawn lp (is CUPS installed?)")?;
     child.stdin.as_mut().ok_or_else(|| anyhow!("no stdin"))?.write_all(bytes)?;
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        return Err(anyhow!("lp failed: {}", String::from_utf8_lossy(&out.stderr)));
+    // Drop stdin so lp sees EOF, then wait with a hard timeout.
+    drop(child.stdin.take());
+    match child.wait_timeout(Duration::from_secs(30))? {
+        Some(status) => {
+            let out = child.wait_with_output()?;
+            if !status.success() {
+                return Err(anyhow!("lp failed: {}", String::from_utf8_lossy(&out.stderr)));
+            }
+            Ok(())
+        }
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(anyhow!("lp timed out after 30s — CUPS queue may be stuck"))
+        }
     }
-    Ok(())
 }
 
 fn send_usb(bytes: &[u8]) -> anyhow::Result<()> {

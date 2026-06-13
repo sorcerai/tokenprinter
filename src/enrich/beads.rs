@@ -1,4 +1,5 @@
 use crate::model::BeadsStats;
+use crate::proc::output_with_timeout;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::process::Command;
@@ -31,8 +32,9 @@ pub fn partition_beads(json: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> 
 
 /// Thin wrapper: run `bd list --json` in `dir` (if `bd` exists) and partition.
 pub fn beads_stats(dir: &std::path::Path, start: DateTime<Utc>, end: DateTime<Utc>) -> BeadsStats {
-    let out = Command::new("bd").current_dir(dir).args(["list","--json"]).output();
-    match out {
+    let mut cmd = Command::new("bd");
+    cmd.current_dir(dir).args(["list","--json"]);
+    match output_with_timeout(cmd, 10) {
         Ok(o) if o.status.success() => {
             partition_beads(&String::from_utf8_lossy(&o.stdout), start, end).unwrap_or_default()
         }

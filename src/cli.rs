@@ -50,11 +50,13 @@ pub fn run() -> anyhow::Result<()> {
     let cfg = Config::load();
     let prices = load_prices();
     match cli.cmd {
-        Cmd::Print { agent, session, last: _, preview } => {
+        Cmd::Print { agent, session, last, preview } => {
             let ag = agent_from_str(&agent)?;
             let adapter = adapter_for(ag).ok_or_else(|| anyhow!("agent {agent} not supported in phase 1"))?;
             let refs = adapter.discover()?;
-            let chosen = pick_session(&refs, session.as_deref())?.clone();
+            // --last overrides --session: force newest-by-mtime selection
+            let session_key = if last { None } else { session.as_deref() };
+            let chosen = pick_session(&refs, session_key)?.clone();
             let sd = adapter.parse(&chosen)?;
 
             let (git, beads, branch) = enrich(&sd);
@@ -107,22 +109,42 @@ fn daily_receipts(prices: &PriceTable, cfg: &Config, date: Option<&str>) -> anyh
     let mut out = Vec::new();
     for adapter in all_adapters() {
         let refs = adapter.discover()?;
-        // merge all sessions for the day into one synthetic SessionData per agent
+        // Merge only the records whose timestamp falls on `day` (record-level, not session-level).
+        // This prevents cross-midnight sessions from being double-counted on both days.
         let mut merged: Option<crate::model::SessionData> = None;
         for r in &refs {
             let sd = match adapter.parse(r) { Ok(s)=>s, Err(_)=>continue };
-            if sd.records.iter().all(|rec| rec.timestamp.date_naive() != day) { continue; }
+            // Keep only records that belong to `day`.
+            let day_records: Vec<_> = sd.records.into_iter()
+                .filter(|rec| rec.timestamp.date_naive() == day)
+                .collect();
+            if day_records.is_empty() { continue; }
+
+            // Derive started_at/ended_at/turns from the matching records.
+            let seg_start = day_records.iter().map(|r| r.timestamp).min().unwrap();
+            let seg_end   = day_records.iter().map(|r| r.timestamp).max().unwrap();
+            let seg_turns = day_records.len() as u32;
+
             match &mut merged {
-                None => merged = Some(sd),
+                None => {
+                    merged = Some(crate::model::SessionData {
+                        agent: sd.agent, session_id: sd.session_id,
+                        project: sd.project, git_branch: sd.git_branch,
+                        started_at: seg_start, ended_at: seg_end,
+                        records: day_records,
+                        tool_calls: sd.tool_calls,
+                        turns: seg_turns,
+                    });
+                }
                 Some(m) => {
-                    m.records.extend(sd.records);
+                    m.records.extend(day_records);
                     for (n,c) in sd.tool_calls {
                         if let Some(e)=m.tool_calls.iter_mut().find(|(x,_)| *x==n){ e.1+=c; }
                         else { m.tool_calls.push((n,c)); }
                     }
-                    if sd.started_at < m.started_at { m.started_at = sd.started_at; }
-                    if sd.ended_at > m.ended_at { m.ended_at = sd.ended_at; }
-                    m.turns += sd.turns;
+                    if seg_start < m.started_at { m.started_at = seg_start; }
+                    if seg_end > m.ended_at { m.ended_at = seg_end; }
+                    m.turns += seg_turns;
                 }
             }
         }
@@ -181,7 +203,9 @@ fn doctor(prices: &PriceTable) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::adapters::SessionRef;
-    use crate::model::Agent;
+    use crate::model::{Agent, CacheTtl, SessionData, UsageRecord};
+    use crate::pricing::PriceTable;
+    use chrono::{NaiveDate, TimeZone, Utc};
     use std::path::PathBuf;
 
     #[test]
@@ -202,5 +226,85 @@ mod tests {
         ];
         let pick = pick_session(&refs, Some("y")).unwrap();
         assert_eq!(pick.session_id, "y");
+    }
+
+    /// Verify daily aggregation counts only records on the target day.
+    /// Session A is fully on 2026-01-15. Session B spans midnight (records on both
+    /// 2026-01-14 and 2026-01-15). The day receipt for 2026-01-15 must include
+    /// session A's tokens and only the matching record from session B — not
+    /// session B's full token total.
+    #[test]
+    fn daily_receipts_does_not_double_count_cross_midnight_sessions() {
+        fn ts(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::DateTime<Utc> {
+            Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+        }
+        fn rec(agent: Agent, ts_val: chrono::DateTime<Utc>, tokens: u64) -> UsageRecord {
+            let mut r = UsageRecord::zeroed(agent, "test-model");
+            r.input = tokens; r.timestamp = ts_val; r.cache_write_ttl = CacheTtl::FiveMin;
+            r
+        }
+
+        let day = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+
+        // Session A: two records fully on 2026-01-15 (100 + 200 = 300 tokens)
+        let sd_a = SessionData {
+            agent: Agent::Claude, session_id: "a".into(), project: None, git_branch: None,
+            started_at: ts(2026, 1, 15, 10, 0), ended_at: ts(2026, 1, 15, 11, 0),
+            records: vec![
+                rec(Agent::Claude, ts(2026, 1, 15, 10, 0), 100),
+                rec(Agent::Claude, ts(2026, 1, 15, 10, 30), 200),
+            ],
+            tool_calls: vec![], turns: 2,
+        };
+
+        // Session B: spans midnight — first record on 2026-01-14 (999 tokens, must be excluded),
+        // second record on 2026-01-15 (50 tokens, must be included).
+        let sd_b = SessionData {
+            agent: Agent::Claude, session_id: "b".into(), project: None, git_branch: None,
+            started_at: ts(2026, 1, 14, 23, 50), ended_at: ts(2026, 1, 15, 0, 30),
+            records: vec![
+                rec(Agent::Claude, ts(2026, 1, 14, 23, 50), 999),
+                rec(Agent::Claude, ts(2026, 1, 15, 0, 30),   50),
+            ],
+            tool_calls: vec![], turns: 2,
+        };
+
+        // Simulate the record-level merge from daily_receipts.
+        let prices = PriceTable::embedded();
+        let cfg = Config::load();
+        let mut merged: Option<SessionData> = None;
+        for sd in [sd_a, sd_b] {
+            let day_records: Vec<_> = sd.records.into_iter()
+                .filter(|r| r.timestamp.date_naive() == day)
+                .collect();
+            if day_records.is_empty() { continue; }
+            let seg_start = day_records.iter().map(|r| r.timestamp).min().unwrap();
+            let seg_end   = day_records.iter().map(|r| r.timestamp).max().unwrap();
+            let seg_turns = day_records.len() as u32;
+            match &mut merged {
+                None => merged = Some(SessionData {
+                    agent: Agent::Claude, session_id: "merged".into(),
+                    project: None, git_branch: None,
+                    started_at: seg_start, ended_at: seg_end,
+                    records: day_records, tool_calls: vec![], turns: seg_turns,
+                }),
+                Some(m) => {
+                    m.records.extend(day_records);
+                    if seg_start < m.started_at { m.started_at = seg_start; }
+                    if seg_end > m.ended_at { m.ended_at = seg_end; }
+                    m.turns += seg_turns;
+                }
+            }
+        }
+        let m = merged.expect("should have merged data");
+        let rc = crate::assemble::assemble_session(
+            &m, &prices, &cfg.location,
+            crate::model::GitStats::default(), crate::model::BeadsStats::default(),
+        );
+        // Expect 300 (session A) + 50 (session B's on-day record) = 350 tokens
+        // Session B's 999-token record on 2026-01-14 must be excluded.
+        assert_eq!(rc.total_tokens, 350,
+            "got {} tokens, expected 350 (should not include session B's 2026-01-14 record)",
+            rc.total_tokens);
     }
 }

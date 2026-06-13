@@ -18,7 +18,7 @@
   "gpt-5.3-codex":     { "input": 1.75, "output": 14.0, "cache_write_5m": 0.0, "cache_write_1h": 0.0, "cache_read": 0.175 },
   "gpt-5.2-codex":     { "input": 1.75, "output": 14.0, "cache_write_5m": 0.0, "cache_write_1h": 0.0, "cache_read": 0.175 },
   "gpt-5.1-codex-max": { "input": 1.25, "output": 10.0, "cache_write_5m": 0.0, "cache_write_1h": 0.0, "cache_read": 0.125 },
-  "gpt-5.1-codex":     { "input": 1.25, "output": 10.0, "cache_write_5m": 0.0, "cache_write_1h": 0.0, "cache_read": 0.13 },
+  "gpt-5.1-codex":     { "input": 1.25, "output": 10.0, "cache_write_5m": 0.0, "cache_write_1h": 0.0, "cache_read": 0.125 },
   "gpt-5-codex":       { "input": 1.25, "output": 10.0, "cache_write_5m": 0.0, "cache_write_1h": 0.0, "cache_read": 0.125 },
   "gpt-5":             { "input": 1.25, "output": 10.0, "cache_write_5m": 0.0, "cache_write_1h": 0.0, "cache_read": 0.125 }
 }

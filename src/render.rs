@@ -13,7 +13,15 @@ fn center(s: &str) -> String {
 fn lr(left: &str, right: &str) -> String {
     let l = left.chars().count();
     let r = right.chars().count();
-    if l + r >= W { return format!("{left} {right}"); }
+    if l + r >= W {
+        // Hard-cap at W: keep as much of left as fits with a space and the right portion.
+        let right_chars: Vec<char> = right.chars().collect();
+        let r_take = right_chars.len().min(W.saturating_sub(1));
+        let l_take = W.saturating_sub(r_take + 1);
+        let left_trunc: String = left.chars().take(l_take).collect();
+        let right_trunc: String = right_chars[..r_take].iter().collect();
+        return format!("{left_trunc} {right_trunc}");
+    }
     format!("{}{}{}", left, " ".repeat(W - l - r), right)
 }
 fn commafy(n: u64) -> String {
@@ -201,6 +209,18 @@ mod tests {
         assert!(s.contains("tp-14"));
         // every line <= 48 cols
         for line in s.lines() { assert!(line.chars().count() <= 48, "too wide: {line:?}"); }
+    }
+
+    #[test]
+    fn long_location_does_not_overflow_48_cols() {
+        let mut r = sample();
+        // 60-char location — longer than the 48-col receipt width
+        r.location = "A".repeat(60);
+        let s = render_text(&r);
+        for line in s.lines() {
+            assert!(line.chars().count() <= 48,
+                "line too wide ({} chars): {line:?}", line.chars().count());
+        }
     }
 
     #[test]

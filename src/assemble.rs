@@ -70,9 +70,11 @@ pub fn assemble_session(
 }
 
 /// 20-bucket token-volume sparkline over the session timeline (heights 0..=7).
+/// Returns empty when there are fewer than 2 records (a single record produces a
+/// meaningless one-full-bar result).
 pub fn sparkline(sd: &SessionData) -> Vec<u8> {
     const N: usize = 20;
-    if sd.records.is_empty() { return vec![]; }
+    if sd.records.len() < 2 { return vec![]; }
     let span = (sd.ended_at - sd.started_at).num_seconds().max(1) as f64;
     let mut buckets = vec![0u64; N];
     for r in &sd.records {
