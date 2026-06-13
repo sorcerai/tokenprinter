@@ -27,51 +27,36 @@ pub fn install_hooks(settings_path: &Path, bin: &str) -> anyhow::Result<()> {
         root["hooks"] = serde_json::json!({});
     }
 
+    // Unique stable sentinels appended to each command string.
+    // Shell treats `# ...` as a comment, so they are harmless when the hook runs.
+    // Dedup checks for the exact sentinel string in the serialized JSON entry.
+    let stop_sentinel = " # tokenprinter-stop";
+    let precompact_sentinel = " # tokenprinter-precompact";
+
     let stop_cmd = format!(
-        "{} print --agent claude --session \"$CLAUDE_SESSION_ID\" --quiet",
-        bin
+        "{bin} print --agent claude --session \"$CLAUDE_SESSION_ID\" --quiet{stop_sentinel}"
     );
     let precompact_cmd = format!(
-        "{} print --agent claude --session \"$CLAUDE_SESSION_ID\" --precompact --quiet",
-        bin
+        "{bin} print --agent claude --session \"$CLAUDE_SESSION_ID\" --precompact --quiet{precompact_sentinel}"
     );
 
-    // Helper: check if an entry in the array already contains a tokenprinter hook
-    // matching the given dedup marker (a unique substring of the command).
-    // We check the JSON-serialized form of the entry against marker substrings
-    // that survive JSON encoding (no special chars).
-    let already_present = |arr: &serde_json::Value, marker: &str| -> bool {
+    // Helper: check if an entry in the array already contains the exact sentinel for this hook.
+    let already_present = |arr: &serde_json::Value, sentinel: &str| -> bool {
         arr.as_array()
             .map(|entries| {
                 entries.iter().any(|e| {
                     let s = e.to_string();
-                    s.contains("tokenprinter") && s.contains(marker)
+                    s.contains(sentinel)
                 })
             })
             .unwrap_or(false)
     };
 
-    // Dedup markers: substrings that are unique to each hook type and survive JSON encoding.
-    // "--precompact" only appears in the PreCompact hook; Stop hook has "--quiet" but not "--precompact".
-    // We also need a marker for Stop that distinguishes it from PreCompact.
-    let stop_marker = "--quiet";      // present in both; combined with "tokenprinter" check and absence of --precompact via array key
-    let precompact_marker = "--precompact";
-
     // Ensure Stop is an array, then maybe append.
     if !root["hooks"]["Stop"].is_array() {
         root["hooks"]["Stop"] = serde_json::json!([]);
     }
-    // For Stop dedup: entry must have tokenprinter AND --quiet AND NOT --precompact
-    let stop_already = root["hooks"]["Stop"]
-        .as_array()
-        .map(|entries| {
-            entries.iter().any(|e| {
-                let s = e.to_string();
-                s.contains("tokenprinter") && s.contains(stop_marker) && !s.contains(precompact_marker)
-            })
-        })
-        .unwrap_or(false);
-    if !stop_already {
+    if !already_present(&root["hooks"]["Stop"], stop_sentinel) {
         let entry = serde_json::json!({
             "hooks": [{"type": "command", "command": stop_cmd}]
         });
@@ -82,7 +67,7 @@ pub fn install_hooks(settings_path: &Path, bin: &str) -> anyhow::Result<()> {
     if !root["hooks"]["PreCompact"].is_array() {
         root["hooks"]["PreCompact"] = serde_json::json!([]);
     }
-    if !already_present(&root["hooks"]["PreCompact"], precompact_marker) {
+    if !already_present(&root["hooks"]["PreCompact"], precompact_sentinel) {
         let entry = serde_json::json!({
             "hooks": [{"type": "command", "command": precompact_cmd}]
         });
@@ -167,6 +152,53 @@ mod tests {
         assert!(v["hooks"]["PreCompact"]
             .to_string()
             .contains("tokenprinter"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stop_sentinel_not_blocked_by_precompact_lookalike() {
+        // A manually-crafted Stop entry that contains "--precompact" (as a foreign command)
+        // but does NOT contain the stop sentinel " # tokenprinter-stop" must NOT prevent
+        // the real Stop hook from being added.
+        let dir = std::env::temp_dir().join(format!(
+            "tp-hooks-{}-sentinel",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // Pre-populate Stop with an entry that contains "--precompact" but NOT the stop sentinel.
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"other-tool --precompact --quiet"}]}]}}"#,
+        )
+        .unwrap();
+
+        install_hooks(&path, "/usr/local/bin/tokenprinter").unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let stop = v["hooks"]["Stop"].as_array().unwrap();
+
+        // The real tokenprinter Stop hook must have been added (sentinel is present).
+        assert!(
+            stop.iter().any(|e| e.to_string().contains("tokenprinter-stop")),
+            "stop sentinel must be present even when a lookalike --precompact entry exists"
+        );
+
+        // Running again must remain idempotent (still exactly one stop-sentinel entry).
+        install_hooks(&path, "/usr/local/bin/tokenprinter").unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let n = v2["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e.to_string().contains("tokenprinter-stop"))
+            .count();
+        assert_eq!(n, 1, "stop sentinel must not duplicate on re-run");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

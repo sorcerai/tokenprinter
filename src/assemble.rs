@@ -77,7 +77,7 @@ pub fn sparkline(sd: &SessionData) -> Vec<u8> {
     const N: usize = 20;
     if sd.records.len() < 2 { return vec![]; }
     let span = (sd.ended_at - sd.started_at).num_seconds().max(1) as f64;
-    let mut buckets = vec![0u64; N];
+    let mut buckets = [0u64; N];
     for r in &sd.records {
         let off = (r.timestamp - sd.started_at).num_seconds().max(0) as f64;
         let mut i = ((off / span) * N as f64) as usize;

@@ -9,6 +9,12 @@ use std::path::PathBuf;
 
 pub struct PiAdapter { root: PathBuf }
 
+impl Default for PiAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PiAdapter {
     pub fn new() -> Self {
         let root = dirs::home_dir().unwrap_or_default().join(".pi/agent/sessions");

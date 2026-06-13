@@ -38,6 +38,12 @@ pub struct AgyAdapter {
     root: PathBuf,
 }
 
+impl Default for AgyAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AgyAdapter {
     pub fn new() -> Self {
         let root = dirs::home_dir()
@@ -90,12 +96,11 @@ fn skip_field(data: &[u8], i: usize, wire_type: u8) -> Option<usize> {
         2 => {
             // length-delimited
             let (len, ni) = decode_varint(data, i)?;
-            let end = ni + len as usize;
-            if end <= data.len() {
-                Some(end)
-            } else {
-                None
-            }
+            let end = match ni.checked_add(len as usize) {
+                Some(e) if e <= data.len() => e,
+                _ => return None,
+            };
+            Some(end)
         }
         5 => {
             // 32-bit
@@ -182,10 +187,10 @@ fn parse_gen_metadata_blob(blob: &[u8]) -> Option<TurnTokens> {
 
         if wire_type == 2 {
             let (len, ni) = decode_varint(blob, i)?;
-            let end = ni + len as usize;
-            if end > blob.len() {
-                break;
-            }
+            let end = match ni.checked_add(len as usize) {
+                Some(e) if e <= blob.len() => e,
+                _ => break,
+            };
             let content = &blob[ni..end];
 
             if field_num == 1 {
@@ -205,10 +210,10 @@ fn parse_gen_metadata_blob(blob: &[u8]) -> Option<TurnTokens> {
                             Some(v) => v,
                             None => break,
                         };
-                        let cend = nj + clen as usize;
-                        if cend > content.len() {
-                            break;
-                        }
+                        let cend = match nj.checked_add(clen as usize) {
+                            Some(e) if e <= content.len() => e,
+                            _ => break,
+                        };
                         let sub = &content[nj..cend];
 
                         if cfn == 4 {
@@ -256,7 +261,7 @@ fn extract_model_name(blob: &[u8]) -> Option<String> {
     let s: String = blob[pos..]
         .iter()
         .copied()
-        .take_while(|&b| b >= 0x20 && b < 0x7F)
+        .take_while(|&b| (0x20..0x7F).contains(&b))
         .map(|b| b as char)
         .collect();
     if s.len() > 7 {
@@ -280,10 +285,10 @@ fn extract_timestamp_from_blob(blob: &[u8]) -> Option<DateTime<Utc>> {
 
         if wire_type == 2 {
             let (len, ni) = decode_varint(blob, i)?;
-            let end = ni + len as usize;
-            if end > blob.len() {
-                break;
-            }
+            let end = match ni.checked_add(len as usize) {
+                Some(e) if e <= blob.len() => e,
+                _ => break,
+            };
             let content = &blob[ni..end];
 
             if field_num == 1 {
@@ -303,10 +308,10 @@ fn extract_timestamp_from_blob(blob: &[u8]) -> Option<DateTime<Utc>> {
                             Some(v) => v,
                             None => break,
                         };
-                        let cend = nj + clen as usize;
-                        if cend > content.len() {
-                            break;
-                        }
+                        let cend = match nj.checked_add(clen as usize) {
+                            Some(e) if e <= content.len() => e,
+                            _ => break,
+                        };
                         let sub = &content[nj..cend];
 
                         if cfn == 9 {
@@ -348,10 +353,10 @@ fn parse_timestamp_submessage(data: &[u8]) -> Option<DateTime<Utc>> {
 
         if field_num == 4 && wire_type == 2 {
             let (len, ni) = decode_varint(data, i)?;
-            let end = ni + len as usize;
-            if end > data.len() {
-                return None;
-            }
+            let end = match ni.checked_add(len as usize) {
+                Some(e) if e <= data.len() => e,
+                _ => return None,
+            };
             let sub = &data[ni..end];
             // Parse F1=secs, F2=nanos
             let mut secs: i64 = 0;
@@ -683,5 +688,29 @@ mod tests {
             let (val, _) = decode_varint(bytes, 0).unwrap();
             assert_eq!(val, *expected, "varint mismatch for expected={}", expected);
         }
+    }
+
+    #[test]
+    fn parse_gen_metadata_blob_handles_varint_max_len_without_panic() {
+        // Construct a blob with a length-delimited field (wire type 2) whose length
+        // varint encodes u64::MAX. This would overflow `ni + len as usize` on a
+        // 64-bit system without checked_add, causing a panic in debug mode.
+        //
+        // Protobuf tag: field 1, wire type 2 = (1 << 3) | 2 = 0x0A
+        // u64::MAX as a protobuf varint = 10 bytes of 0xFF followed by 0x01
+        // Total blob: tag byte + 10-byte varint (representing u64::MAX length).
+        let mut blob = vec![0x0Au8]; // tag: field=1, wire_type=2 (length-delimited)
+        // Encode u64::MAX as varint: 9 bytes of 0xFF + final 0x01
+        blob.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]);
+        // The blob ends here — no actual data follows, so end > blob.len() must be
+        // caught by checked_add before any slice indexing occurs.
+
+        // Must not panic (would panic in debug without the overflow guard).
+        let result = parse_gen_metadata_blob(&blob);
+        // No valid token data was decoded, so result is None or found=false => None.
+        assert!(
+            result.is_none(),
+            "expected None for oversized-length blob, got Some"
+        );
     }
 }

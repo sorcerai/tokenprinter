@@ -24,7 +24,7 @@ pub fn qr_raster(data: &str) -> Vec<u8> {
     let dot_size = modules * N;
 
     // bytes_per_row: ceil(dot_size / 8)
-    let bytes_per_row = (dot_size + 7) / 8;
+    let bytes_per_row = dot_size.div_ceil(8);
     let height_dots = dot_size;
 
     // Build the bitmap: row-major, MSB = leftmost dot, 1 = black.
@@ -86,7 +86,7 @@ pub fn render_bytes_with_qr(r: &Receipt, qr_data: Option<&str>) -> Vec<u8> {
     b
 }
 
-fn rule(c: char) -> String { std::iter::repeat(c).take(W).collect() }
+fn rule(c: char) -> String { std::iter::repeat_n(c, W).collect() }
 fn center(s: &str) -> String {
     let n = s.chars().count();
     if n >= W { return s.chars().take(W).collect(); }
@@ -117,10 +117,10 @@ fn commafy(n: u64) -> String {
     }
     out.chars().rev().collect()
 }
-fn money(v: f64) -> String { format!("${:.2}", v) }
+fn money(v: f64) -> String { format!("${v:.2}") }
 fn dur(secs: i64) -> String {
     let h = secs / 3600; let m = (secs % 3600) / 60; let s = secs % 60;
-    format!("{:01}h {:02}m {:02}s", h, m, s)
+    format!("{h:01}h {m:02}m {s:02}s")
 }
 const SPARK: [char; 8] = ['▁','▁','▂','▃','▅','▆','▇','█'];
 
@@ -155,23 +155,23 @@ pub fn render_text(r: &Receipt) -> String {
         push(&mut o, lr("   Cache write", &format!("{} ", commafy(m.cache_write))));
         push(&mut o, lr("   Cache read", &format!("{} ", commafy(m.cache_read))));
         let sub = match m.cost { Some(c)=>money(c), None=>"—".into() };
-        push(&mut o, lr("   Subtotal", &format!("{} ", sub)));
+        push(&mut o, lr("   Subtotal", &format!("{sub} ")));
         push(&mut o, String::new());
     }
 
     let calls: u32 = r.tools.iter().map(|(_,c)| *c).sum();
     push(&mut o, rule('-'));
-    push(&mut o, lr(" TOOL ACTIVITY", &format!("({} calls) ", calls)));
+    push(&mut o, lr(" TOOL ACTIVITY", &format!("({calls} calls) ")));
     push(&mut o, rule('-'));
     let maxc = r.tools.iter().map(|(_,c)| *c).max().unwrap_or(1).max(1);
     for (name, c) in r.tools.iter().take(6) {
         let bars = ((*c as f64 / maxc as f64) * 11.0).round() as usize;
-        let bar: String = std::iter::repeat('█').take(bars).collect();
-        push(&mut o, lr(&format!("   {:<10}{}", trunc(name,10), bar), &format!("{} ", c)));
+        let bar: String = std::iter::repeat_n('█', bars).collect();
+        push(&mut o, lr(&format!("   {:<10}{}", trunc(name,10), bar), &format!("{c} ")));
     }
     if r.tools.len() > 6 {
         let rest: u32 = r.tools.iter().skip(6).map(|(_,c)| *c).sum();
-        push(&mut o, lr(&format!("   +{} more", r.tools.len()-6), &format!("{} ", rest)));
+        push(&mut o, lr(&format!("   +{} more", r.tools.len()-6), &format!("{rest} ")));
     }
 
     push(&mut o, rule('-'));
@@ -191,7 +191,7 @@ pub fn render_text(r: &Receipt) -> String {
         push(&mut o, rule('-'));
         push(&mut o, " TOKENS OVER TIME".into());
         let spark: String = r.sparkline.iter().map(|&h| SPARK[(h as usize).min(7)]).collect();
-        push(&mut o, format!("   {}", spark));
+        push(&mut o, format!("   {spark}"));
     }
 
     push(&mut o, rule('='));
@@ -229,11 +229,11 @@ fn project_value(raw_path: &str, branch: Option<&str>) -> String {
         path.clone()
     } else {
         let tail: String = path_chars[path_chars.len().saturating_sub(path_budget.saturating_sub(1))..].iter().collect();
-        format!("…{}", tail)
+        format!("…{tail}")
     };
     match branch {
-        Some(b) => format!("{} ({}) ", truncated_path, b),
-        None => format!("{} ", truncated_path),
+        Some(b) => format!("{truncated_path} ({b}) "),
+        None => format!("{truncated_path} "),
     }
 }
 
@@ -243,7 +243,7 @@ fn trunc(s: &str, n: usize) -> String {
 fn short_path(p: &str) -> String {
     if let Some(home) = dirs::home_dir() {
         if let Some(h) = home.to_str() {
-            if let Some(stripped) = p.strip_prefix(h) { return format!("~{}", stripped); }
+            if let Some(stripped) = p.strip_prefix(h) { return format!("~{stripped}"); }
         }
     }
     p.to_string()

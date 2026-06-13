@@ -166,16 +166,14 @@ pub fn run() -> anyhow::Result<()> {
             triggers::hooks::install_hooks(&settings_path, &bin_path)?;
 
             let stop_cmd = format!(
-                "{} print --agent claude --session \"$CLAUDE_SESSION_ID\" --quiet",
-                bin_path
+                "{bin_path} print --agent claude --session \"$CLAUDE_SESSION_ID\" --quiet"
             );
             let precompact_cmd = format!(
-                "{} print --agent claude --session \"$CLAUDE_SESSION_ID\" --precompact --quiet",
-                bin_path
+                "{bin_path} print --agent claude --session \"$CLAUDE_SESSION_ID\" --precompact --quiet"
             );
             println!("Added hooks to: {}", settings_path.display());
-            println!("  Stop      → {}", stop_cmd);
-            println!("  PreCompact→ {}", precompact_cmd);
+            println!("  Stop      → {stop_cmd}");
+            println!("  PreCompact→ {precompact_cmd}");
             println!();
             println!(
                 "NOTE: This modified your live Claude settings; remove the tokenprinter entries from {} to undo.",
@@ -379,8 +377,8 @@ pub fn audit_rows(sd: &crate::model::SessionData, prices: &PriceTable) -> Vec<Au
 
 fn print_audit_table(sd: &crate::model::SessionData, prices: &PriceTable) {
     let rows = audit_rows(sd, prices);
-    println!("{:<30} {:>10} {:>10} {:>12} {:>12} {:>14} {:>10} {}",
-        "model", "input", "output", "cache_write", "cache_read", "context_size", "cost", "flags");
+    println!("{:<30} {:>10} {:>10} {:>12} {:>12} {:>14} {:>10} flags",
+        "model", "input", "output", "cache_write", "cache_read", "context_size", "cost");
     println!("{}", "-".repeat(100));
     let mut total_input = 0u64;
     let mut total_output = 0u64;
@@ -389,7 +387,7 @@ fn print_audit_table(sd: &crate::model::SessionData, prices: &PriceTable) {
     let mut total_cost = 0f64;
     let mut any_cost = false;
     for r in &rows {
-        let cost_str = match r.cost { Some(c) => { any_cost = true; total_cost += c; format!("${:.4}", c) } None => "—".into() };
+        let cost_str = match r.cost { Some(c) => { any_cost = true; total_cost += c; format!("${c:.4}") } None => "—".into() };
         let flags = if r.overlap { "OVERLAP!" } else { "" };
         println!("{:<30} {:>10} {:>10} {:>12} {:>12} {:>14} {:>10} {}",
             r.model, r.input, r.output, r.cache_write, r.cache_read, r.context_size, cost_str, flags);
@@ -399,7 +397,7 @@ fn print_audit_table(sd: &crate::model::SessionData, prices: &PriceTable) {
         total_cr += r.cache_read;
     }
     println!("{}", "-".repeat(100));
-    let total_cost_str = if any_cost { format!("${:.4}", total_cost) } else { "—".into() };
+    let total_cost_str = if any_cost { format!("${total_cost:.4}") } else { "—".into() };
     println!("{:<30} {:>10} {:>10} {:>12} {:>12} {:>14} {:>10}",
         "TOTAL", total_input, total_output, total_cw, total_cr, "", total_cost_str);
 }
