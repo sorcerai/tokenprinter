@@ -1,0 +1,20 @@
+{
+  "claude-opus-4-8": {
+    "input": 15.0, "output": 75.0,
+    "cache_write_5m": 18.75, "cache_write_1h": 30.0, "cache_read": 1.5,
+    "tier_over_200k": { "input": 30.0, "output": 150.0,
+      "cache_write_5m": 37.5, "cache_write_1h": 60.0, "cache_read": 3.0 }
+  },
+  "claude-sonnet-4-6": {
+    "input": 3.0, "output": 15.0,
+    "cache_write_5m": 3.75, "cache_write_1h": 6.0, "cache_read": 0.3,
+    "tier_over_200k": { "input": 6.0, "output": 22.5,
+      "cache_write_5m": 7.5, "cache_write_1h": 12.0, "cache_read": 0.6 }
+  },
+  "claude-haiku-4-5": {
+    "input": 1.0, "output": 5.0,
+    "cache_write_5m": 1.25, "cache_write_1h": 2.0, "cache_read": 0.1
+  },
+  "gpt-5.5": { "input": 1.25, "output": 10.0,
+    "cache_write_5m": 0.0, "cache_write_1h": 0.0, "cache_read": 0.125 }
+}
