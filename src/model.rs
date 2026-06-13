@@ -21,7 +21,7 @@ impl Agent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheTtl { FiveMin, OneHour }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UsageRecord {
     pub agent: Agent,
     pub provider: String,
@@ -48,6 +48,9 @@ impl UsageRecord {
             context_size: 0, cache_write_ttl: CacheTtl::FiveMin, cost: None,
         }
     }
+    /// Billable token count: input + output + cache_write + cache_read.
+    /// `reasoning` is intentionally excluded — it is not billed separately and
+    /// would double-count output tokens on the Anthropic API.
     pub fn total_tokens(&self) -> u64 {
         self.input + self.output + self.cache_write + self.cache_read
     }
@@ -70,7 +73,7 @@ pub struct SessionData {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope { Session, Daily, OnDemand }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelLine {
     pub model: String,
     pub input: u64, pub output: u64, pub cache_write: u64, pub cache_read: u64,
@@ -122,5 +125,11 @@ mod tests {
         let mut r2 = r.clone();
         r2.input = 100; r2.output = 200; r2.cache_write = 10; r2.cache_read = 5;
         assert_eq!(r2.total_tokens(), 315);
+    }
+    #[test]
+    fn total_tokens_excludes_reasoning() {
+        let mut r = UsageRecord::zeroed(Agent::Claude, "claude-opus-4-8");
+        r.input = 100; r.output = 200; r.cache_write = 10; r.cache_read = 5; r.reasoning = 999;
+        assert_eq!(r.total_tokens(), 315); // reasoning intentionally excluded
     }
 }
