@@ -131,6 +131,9 @@ pub fn render_text(r: &Receipt) -> String {
     push(&mut o, center(&r.agent.provider().to_uppercase()));
     push(&mut o, rule('='));
     push(&mut o, center("TOKEN PRINTER"));
+    if r.precompact {
+        push(&mut o, center("PRE-COMPACTION MEMORIAL"));
+    }
     push(&mut o, rule('='));
     push(&mut o, lr(" Agent", &format!("{} ", r.agent.label())));
     push(&mut o, lr(" Location", &format!("{} ", r.location)));
@@ -271,6 +274,7 @@ mod tests {
             git: GitStats{files_changed:12,added:1204,removed:317,commits:3},
             beads: BeadsStats{opened:vec!["tp-14".into()],closed:vec!["tp-9".into()]},
             sparkline: vec![1,2,3,5,7,6,4,3,2,1],
+            precompact: false,
         }
     }
 
