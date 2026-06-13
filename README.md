@@ -65,14 +65,15 @@ Inspired by [`chrishutchinson/claude-receipts`](https://github.com/chrishutchins
 - **Detail.** Per-model token breakdown, tool-call bar chart, git productivity (files/lines/commits), beads tickets opened/closed, a tokens-over-time sparkline, cache-savings, burn rate, and a native QR code.
 - **Subscription-aware.** Costs are API-list-equivalent; on a flat-rate subscription the TOTAL is labeled *"not charged."*
 
-## Supported agents
+## Supported agents / sources
 
-| Agent | Source | Notes |
+| Agent / Source | Source | Notes |
 |---|---|---|
 | **Claude Code** | `~/.claude/projects/**/*.jsonl` | per-turn `message.usage` |
 | **Codex** | `~/.codex/sessions/**/rollout-*.jsonl` | cumulative `token_count` events; session-granular |
 | **pi** | `~/.pi/agent/sessions/**/*.jsonl` | uses pi's own reported cost |
 | **Antigravity (agy)** | `~/.gemini/antigravity-cli/conversations/*.db` | token usage extracted from SQLite `gen_metadata` protobuf blobs |
+| **OpenRouter** | `openrouter.ai` REST API | spend receipt: credits purchased, total used, remaining, daily/weekly/monthly. Per-model breakdown requires a management key (non-management keys get 403 from `/activity`, silently ignored). |
 
 ## Install
 
@@ -88,6 +89,12 @@ tokenprinter doctor                            # checks lp/git/bd + lists discov
 ## Usage
 
 ```bash
+# OpenRouter spend receipt (preview to terminal):
+OPENROUTER_API_KEY=sk-or-... tokenprinter openrouter --preview
+
+# OpenRouter spend receipt (send to printer):
+OPENROUTER_API_KEY=sk-or-... tokenprinter openrouter
+
 # Per-session receipt (latest Claude session), preview to terminal:
 tokenprinter print --agent claude --preview
 
@@ -125,6 +132,9 @@ billing    = "subscription"         # "subscription" → TOTAL labeled "not char
 queue_name = "Star_TSP654"          # CUPS print queue
 transport  = "auto"                 # auto | cups | usb
 idle_seconds = 90                   # watch daemon: print a session after this many idle seconds
+
+# OpenRouter (alternative: OPENROUTER_API_KEY env var; env var takes precedence)
+openrouter_key = ""
 
 # section toggles
 show_tools = true
@@ -165,6 +175,7 @@ src/
   pricing.rs + prices.json            per-category hybrid pricing
   assemble.rs                         records → Receipt (totals, cache metrics, burn, sparkline)
   render.rs                           48-col text + Star Line bytes + QR raster
+  openrouter.rs                       OpenRouter spend-receipt source (REST API)
   transport.rs                        CUPS → USB fallback
   watch.rs                            idle-detection daemon
   triggers/{hooks,launchd}.rs         install-hooks / install-watcher

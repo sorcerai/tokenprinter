@@ -50,5 +50,5 @@ fn real_sessions_pass_context_size_invariant() {
         }
     }
 
-    eprintln!("real_data: validated {} records across all adapters (cap {} sessions each)", total_validated, CAP);
+    eprintln!("real_data: validated {total_validated} records across all adapters (cap {CAP} sessions each)");
 }

@@ -88,15 +88,15 @@ pub fn render_bytes_with_qr(r: &Receipt, qr_data: Option<&str>) -> Vec<u8> {
     b
 }
 
-fn rule(c: char) -> String { std::iter::repeat_n(c, W).collect() }
-fn center(s: &str) -> String {
+pub(crate) fn rule(c: char) -> String { std::iter::repeat_n(c, W).collect() }
+pub(crate) fn center(s: &str) -> String {
     let n = s.chars().count();
     if n >= W { return s.chars().take(W).collect(); }
     let pad = (W - n) / 2;
     format!("{}{}", " ".repeat(pad), s)
 }
 /// left text + right-aligned value on one W-wide line.
-fn lr(left: &str, right: &str) -> String {
+pub(crate) fn lr(left: &str, right: &str) -> String {
     let l = left.chars().count();
     let r = right.chars().count();
     if l + r >= W {
@@ -110,7 +110,7 @@ fn lr(left: &str, right: &str) -> String {
     }
     format!("{}{}{}", left, " ".repeat(W - l - r), right)
 }
-fn commafy(n: u64) -> String {
+pub(crate) fn commafy(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, ch) in s.chars().rev().enumerate() {
@@ -119,7 +119,10 @@ fn commafy(n: u64) -> String {
     }
     out.chars().rev().collect()
 }
-fn money(v: f64) -> String { format!("${v:.2}") }
+pub(crate) fn money(v: f64) -> String { format!("${v:.2}") }
+pub(crate) fn trunc_pub(s: &str, n: usize) -> String {
+    if s.chars().count() <= n { s.to_string() } else { s.chars().take(n.saturating_sub(1)).collect::<String>() + "…" }
+}
 fn dur(secs: i64) -> String {
     let h = secs / 3600; let m = (secs % 3600) / 60; let s = secs % 60;
     format!("{h:01}h {m:02}m {s:02}s")
