@@ -686,7 +686,7 @@ mod tests {
         ];
         for (expected, bytes) in cases {
             let (val, _) = decode_varint(bytes, 0).unwrap();
-            assert_eq!(val, *expected, "varint mismatch for expected={}", expected);
+            assert_eq!(val, *expected, "varint mismatch for expected={expected}");
         }
     }
 

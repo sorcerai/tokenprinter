@@ -25,5 +25,6 @@ rusb = "0.9"
 wait-timeout = "0.2"
 qrcode = "0.14"
 rusqlite = "0.31.0"
+ureq = "2"
 
 [dev-dependencies]

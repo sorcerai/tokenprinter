@@ -3,6 +3,7 @@ use crate::assemble::assemble_session;
 use crate::config::Config;
 use crate::enrich::{beads::beads_stats, git::{current_branch, git_stats}};
 use crate::model::{Agent, GitStats, BeadsStats};
+use crate::openrouter;
 use crate::pricing::PriceTable;
 use crate::render::{render_bytes, render_bytes_with_qr, render_text};
 use crate::transport::{send, Mode};
@@ -59,6 +60,16 @@ enum Cmd {
         #[arg(long)] preview: bool,
         /// Override the idle threshold in seconds (default: from config).
         #[arg(long)] idle: Option<u64>,
+    },
+    /// Fetch and print an OpenRouter spend receipt.
+    ///
+    /// Reads the API key from OPENROUTER_API_KEY env var, falling back to
+    /// `openrouter_key` in the config file. Per-model token breakdown requires
+    /// a management key (non-management keys receive 403 from /activity, which
+    /// is silently ignored).
+    Openrouter {
+        /// Print receipt as text to stdout instead of sending to printer.
+        #[arg(long)] preview: bool,
     },
 }
 
@@ -215,6 +226,28 @@ pub fn run() -> anyhow::Result<()> {
             if let Some(s) = idle { cfg2.idle_seconds = s; }
             crate::watch::watch_loop(once, preview, &cfg2, &prices)?;
         }
+        Cmd::Openrouter { preview } => {
+            // Resolve key: env var first, then config field.
+            let key = std::env::var("OPENROUTER_API_KEY")
+                .unwrap_or_else(|_| cfg.openrouter_key.clone());
+            if key.is_empty() {
+                eprintln!(
+                    "error: no OpenRouter API key found.\n\
+                     Set OPENROUTER_API_KEY env var or add `openrouter_key = \"sk-or-...\"` \
+                     to your tokenprinter config."
+                );
+                std::process::exit(1);
+            }
+            let stmt = openrouter::fetch_statement(&key)?;
+            let when = chrono::Utc::now();
+            if preview {
+                print!("{}", openrouter::render_statement_text(&stmt, when));
+            } else {
+                let qr_data = if cfg.show_qr { Some("https://openrouter.ai/activity") } else { None };
+                let bytes = openrouter::render_statement_bytes(&stmt, when, qr_data);
+                send(&bytes, Mode::parse(&cfg.transport), &cfg.queue_name)?;
+            }
+        }
         Cmd::InstallWatcher { out, label, idle } => {
             let cfg2 = Config::load();
             let idle_seconds = idle.unwrap_or(cfg2.idle_seconds);
@@ -334,8 +367,13 @@ fn daily_receipts(prices: &PriceTable, cfg: &Config, date: Option<&str>) -> anyh
 }
 
 fn doctor(prices: &PriceTable) -> anyhow::Result<()> {
+    let cfg = Config::load();
     println!("tokenprinter doctor");
     println!("  config: {}", Config::path().display());
+    // OpenRouter key status (no network call — just presence check)
+    let or_key_set = std::env::var("OPENROUTER_API_KEY").map(|v| !v.is_empty()).unwrap_or(false)
+        || !cfg.openrouter_key.is_empty();
+    println!("  openrouter key: {}", if or_key_set { "set" } else { "not set" });
     // tool availability
     let cups_ok = std::process::Command::new("lpstat").args(["-r"]).output()
         .map(|o| o.status.success()).unwrap_or(false);
