@@ -73,7 +73,7 @@ Inspired by [`chrishutchinson/claude-receipts`](https://github.com/chrishutchins
 | **Codex** | `~/.codex/sessions/**/rollout-*.jsonl` | cumulative `token_count` events; session-granular |
 | **pi** | `~/.pi/agent/sessions/**/*.jsonl` | uses pi's own reported cost |
 | **Antigravity (agy)** | `~/.gemini/antigravity-cli/conversations/*.db` | token usage extracted from SQLite `gen_metadata` protobuf blobs |
-| **OpenRouter** | `openrouter.ai` REST API | spend receipt: credits purchased, total used, remaining, daily/weekly/monthly. Per-model breakdown requires a management key (non-management keys get 403 from `/activity`, silently ignored). |
+| **OpenRouter** | `openrouter.ai` REST API | spend receipt: credits purchased, total used, remaining, account period spend (Last 24h/7d/30d). **Per-model MODEL BREAKDOWN requires a management API key** — `/activity` returns 403 for non-management keys, which is silently ignored; you still get the CREDITS/spend section with any key. Activity figures are account-wide; credits Total/Used/Remaining are lifetime. |
 
 ## Install
 
@@ -89,8 +89,14 @@ tokenprinter doctor                            # checks lp/git/bd + lists discov
 ## Usage
 
 ```bash
-# OpenRouter spend receipt (preview to terminal):
+# OpenRouter spend receipt (preview to terminal, last 30 days by default):
 OPENROUTER_API_KEY=sk-or-... tokenprinter openrouter --preview
+
+# Last 7 days only (smaller model breakdown):
+OPENROUTER_API_KEY=sk-or-... tokenprinter openrouter --days 7 --preview
+
+# Exactly one day:
+OPENROUTER_API_KEY=sk-or-... tokenprinter openrouter --date 2026-06-12 --preview
 
 # OpenRouter spend receipt (send to printer):
 OPENROUTER_API_KEY=sk-or-... tokenprinter openrouter

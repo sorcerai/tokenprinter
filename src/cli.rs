@@ -70,6 +70,10 @@ enum Cmd {
     Openrouter {
         /// Print receipt as text to stdout instead of sending to printer.
         #[arg(long)] preview: bool,
+        /// Show activity for the last N days (default: 30). Ignored when --date is set.
+        #[arg(long, default_value = "30")] days: u32,
+        /// Show activity for exactly this date (YYYY-MM-DD). Overrides --days.
+        #[arg(long)] date: Option<String>,
     },
 }
 
@@ -226,7 +230,7 @@ pub fn run() -> anyhow::Result<()> {
             if let Some(s) = idle { cfg2.idle_seconds = s; }
             crate::watch::watch_loop(once, preview, &cfg2, &prices)?;
         }
-        Cmd::Openrouter { preview } => {
+        Cmd::Openrouter { preview, days, date } => {
             // Resolve key: env var first, then config field.
             let key = std::env::var("OPENROUTER_API_KEY")
                 .unwrap_or_else(|_| cfg.openrouter_key.clone());
@@ -238,7 +242,15 @@ pub fn run() -> anyhow::Result<()> {
                 );
                 std::process::exit(1);
             }
-            let stmt = openrouter::fetch_statement(&key)?;
+            // Build the activity window from --date or --days.
+            let window = if let Some(d) = date {
+                let parsed = chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d")
+                    .context("--date must be YYYY-MM-DD")?;
+                openrouter::ActivityWindow::Day(parsed)
+            } else {
+                openrouter::ActivityWindow::LastDays(days)
+            };
+            let stmt = openrouter::fetch_statement(&key, window)?;
             let when = chrono::Utc::now();
             if preview {
                 print!("{}", openrouter::render_statement_text(&stmt, when));
@@ -246,6 +258,7 @@ pub fn run() -> anyhow::Result<()> {
                 let qr_data = if cfg.show_qr { Some("https://openrouter.ai/activity") } else { None };
                 let bytes = openrouter::render_statement_bytes(&stmt, when, qr_data);
                 send(&bytes, Mode::parse(&cfg.transport), &cfg.queue_name)?;
+                eprintln!("printed OpenRouter receipt");
             }
         }
         Cmd::InstallWatcher { out, label, idle } => {

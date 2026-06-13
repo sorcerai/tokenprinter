@@ -5,12 +5,13 @@
 //!   - `/key`       (required) — key metadata including daily/weekly/monthly usage
 //!   - `/activity`  (best-effort) — per-model breakdown; on 403 or parse error, silently skipped.
 //!     Requires a management key. Returns daily rows (~30 days × models × endpoints).
-//!     We aggregate by `model`, summing prompt_tokens, completion_tokens, and usage (USD cost)
-//!     across all rows, then sort by total cost descending.
+//!     We filter rows by the requested window (last N days or a specific date), aggregate by
+//!     `model`, summing prompt_tokens, completion_tokens, and usage (USD cost) across those rows,
+//!     then sort by total cost descending.
 //!     NOTE: /activity covers the last ~30 days; /credits total_usage is lifetime.
 
 use anyhow::{anyhow, Context};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
 
 use crate::render::{center, commafy, lr, money, qr_raster, rule, trunc_pub};
@@ -21,9 +22,62 @@ const TIMEOUT_MS: u64 = 20_000;
 
 // ── Public types ────────────────────────────────────────────────────────────
 
-/// Per-model activity row from /activity (management keys only).
+/// Activity window: either the last N days or a specific calendar date.
+#[derive(Debug, Clone)]
+pub enum ActivityWindow {
+    /// Include rows from the last N days (today - (N-1) days ≤ row_date ≤ today).
+    LastDays(u32),
+    /// Include only rows whose date matches exactly.
+    Day(NaiveDate),
+}
+
+impl ActivityWindow {
+    /// Human-readable label for the MODEL BREAKDOWN header.
+    pub fn label(&self) -> String {
+        match self {
+            ActivityWindow::LastDays(n) => format!("last {n} days"),
+            ActivityWindow::Day(d) => d.format("%Y-%m-%d").to_string(),
+        }
+    }
+
+    /// True if this row's date falls within the window.
+    pub fn includes(&self, row_date: NaiveDate) -> bool {
+        let today = Utc::now().date_naive();
+        match self {
+            ActivityWindow::LastDays(n) => {
+                let cutoff = today - chrono::Duration::days((*n as i64).saturating_sub(1));
+                row_date >= cutoff
+            }
+            ActivityWindow::Day(d) => row_date == *d,
+        }
+    }
+}
+
+/// Raw activity row from /activity, before aggregation.
+#[derive(Debug, Clone)]
+pub struct ActivityRow {
+    /// "YYYY-MM-DD" (first 10 chars of the API's "YYYY-MM-DD HH:MM:SS" date field).
+    pub date: String,
+    pub model: String,
+    pub prompt: u64,
+    pub completion: u64,
+    pub cost: f64,
+}
+
+/// Per-model activity row after aggregation.
 /// Fields: (model_name, prompt_tokens, completion_tokens, cost_usd)
 pub type ModelRow = (String, Option<u64>, Option<u64>, f64);
+
+/// Account-level period spend, derived from /activity rows.
+#[derive(Debug, Default)]
+pub struct PeriodSpend {
+    /// Sum of costs on the most recent date present in activity rows.
+    pub last_24h: f64,
+    /// Sum of costs for rows within the last 7 days.
+    pub last_7d: f64,
+    /// Sum of costs for rows within the last 30 days.
+    pub last_30d: f64,
+}
 
 #[derive(Debug)]
 pub struct OpenRouterStatement {
@@ -31,12 +85,17 @@ pub struct OpenRouterStatement {
     pub total_usage: f64,
     pub remaining: f64,
     pub key_label: String,
+    /// Key-scoped usage (from /key); used as fallback when activity unavailable.
     pub usage_daily: f64,
     pub usage_weekly: f64,
     pub usage_monthly: f64,
     pub limit_remaining: Option<f64>,
-    /// Per-model breakdown from /activity. Empty if unavailable (non-management key returns 403).
+    /// Per-model breakdown from /activity (filtered to window). Empty if unavailable.
     pub models: Vec<ModelRow>,
+    /// Account-accurate period spend (from activity rows). None if /activity unavailable.
+    pub period_spend: Option<PeriodSpend>,
+    /// The window label, e.g. "last 30 days" or "2026-06-12".
+    pub window_label: String,
 }
 
 // ── HTTP fetch ───────────────────────────────────────────────────────────────
@@ -71,8 +130,9 @@ fn get_activity_json(agent: &ureq::Agent, url: &str, key: &str) -> Option<String
     }
 }
 
-pub fn fetch_statement(key: &str) -> anyhow::Result<OpenRouterStatement> {
+pub fn fetch_statement(key: &str, window: ActivityWindow) -> anyhow::Result<OpenRouterStatement> {
     let agent = build_agent();
+    let window_label = window.label();
 
     let credits_body = get_json(&agent, &format!("{OR_BASE}/credits"), key)?;
     let (total_credits, total_usage) =
@@ -81,9 +141,22 @@ pub fn fetch_statement(key: &str) -> anyhow::Result<OpenRouterStatement> {
     let key_body = get_json(&agent, &format!("{OR_BASE}/key"), key)?;
     let ki = parse_key(&key_body).context("parsing /key response")?;
 
-    let models = match get_activity_json(&agent, &format!("{OR_BASE}/activity"), key) {
-        Some(body) => parse_activity(&body),
-        None => vec![],
+    let (models, period_spend) = match get_activity_json(&agent, &format!("{OR_BASE}/activity"), key) {
+        Some(body) => {
+            let raw = parse_activity_rows(&body);
+            let spend = compute_period_spend(&raw);
+            let filtered: Vec<ActivityRow> = raw
+                .into_iter()
+                .filter(|r| {
+                    NaiveDate::parse_from_str(&r.date, "%Y-%m-%d")
+                        .map(|d| window.includes(d))
+                        .unwrap_or(false)
+                })
+                .collect();
+            let models = aggregate_rows(filtered);
+            (models, Some(spend))
+        }
+        None => (vec![], None),
     };
 
     Ok(OpenRouterStatement {
@@ -96,6 +169,8 @@ pub fn fetch_statement(key: &str) -> anyhow::Result<OpenRouterStatement> {
         usage_monthly: ki.usage_monthly,
         limit_remaining: ki.limit_remaining,
         models,
+        period_spend,
+        window_label,
     })
 }
 
@@ -142,22 +217,18 @@ pub fn parse_key(body: &str) -> anyhow::Result<KeyInfo> {
     Ok(KeyInfo { label, usage_daily, usage_weekly, usage_monthly, limit_remaining })
 }
 
-/// Parse the /activity response body and aggregate by model (best-effort).
+/// Parse the /activity response body into raw rows (best-effort; skips malformed rows).
 ///
 /// The real shape (management key only) is:
 ///   `{"data": [...rows]}` where each row has:
+///   - `date`               (string)  — "YYYY-MM-DD HH:MM:SS"; we take the first 10 chars
 ///   - `model`              (string)  — e.g. "anthropic/claude-sonnet-4.6"
 ///   - `prompt_tokens`      (u64)     — input tokens for this day/endpoint slice
 ///   - `completion_tokens`  (u64)     — output tokens
 ///   - `usage`              (f64)     — USD cost
-///     (plus date, model_permaslug, endpoint_id, provider_name, etc. — ignored)
 ///
-/// We aggregate: for each unique `model`, sum prompt_tokens, completion_tokens, usage across
-/// all ~30 days × endpoints rows. Result is sorted by total cost descending.
-/// Returns an empty Vec on any error, missing `data`, non-array body, or 403 response.
-pub fn parse_activity(body: &str) -> Vec<ModelRow> {
-    use std::collections::HashMap;
-
+/// Returns an empty Vec on any error, missing `data`, or non-array body.
+pub fn parse_activity_rows(body: &str) -> Vec<ActivityRow> {
     let v: Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(_) => return vec![],
@@ -167,30 +238,38 @@ pub fn parse_activity(body: &str) -> Vec<ModelRow> {
         None => return vec![],
     };
 
-    // Accumulate: model → (prompt_tokens, completion_tokens, cost)
+    arr.iter()
+        .filter_map(|item| {
+            let obj = item.as_object()?;
+            let model = obj.get("model").and_then(|m| m.as_str()).filter(|m| !m.is_empty())?;
+            // Take the first 10 chars of the date string ("YYYY-MM-DD")
+            let date_raw = obj.get("date").and_then(|d| d.as_str()).unwrap_or("");
+            let date: String = date_raw.chars().take(10).collect();
+            // Validate date is parseable; skip row if malformed
+            if NaiveDate::parse_from_str(&date, "%Y-%m-%d").is_err() {
+                return None;
+            }
+            let cost = obj.get("usage").and_then(|u| u.as_f64()).unwrap_or(0.0);
+            let prompt = obj.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+            let completion = obj.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+            Some(ActivityRow { date, model: model.to_string(), prompt, completion, cost })
+        })
+        .collect()
+}
+
+/// Aggregate raw rows by model, summing tokens and cost. Returns rows sorted by cost descending.
+pub fn aggregate_rows(rows: Vec<ActivityRow>) -> Vec<ModelRow> {
+    use std::collections::HashMap;
+
     let mut agg: HashMap<String, (u64, u64, f64)> = HashMap::new();
-
-    for item in arr {
-        let obj = match item.as_object() {
-            Some(o) => o,
-            None => continue,
-        };
-        // Skip rows with no model name
-        let model = match obj.get("model").and_then(|m| m.as_str()) {
-            Some(m) if !m.is_empty() => m.to_string(),
-            _ => continue,
-        };
-        let cost = obj.get("usage").and_then(|u| u.as_f64()).unwrap_or(0.0);
-        let pt = obj.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-        let ct = obj.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-
-        let entry = agg.entry(model).or_insert((0, 0, 0.0));
-        entry.0 += pt;
-        entry.1 += ct;
-        entry.2 += cost;
+    for row in rows {
+        let entry = agg.entry(row.model).or_insert((0, 0, 0.0));
+        entry.0 += row.prompt;
+        entry.1 += row.completion;
+        entry.2 += row.cost;
     }
 
-    let mut rows: Vec<ModelRow> = agg
+    let mut result: Vec<ModelRow> = agg
         .into_iter()
         .map(|(model, (pt, ct, cost))| {
             let prompt = if pt > 0 { Some(pt) } else { None };
@@ -199,9 +278,44 @@ pub fn parse_activity(body: &str) -> Vec<ModelRow> {
         })
         .collect();
 
-    // Sort by cost descending
-    rows.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
-    rows
+    result.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    result
+}
+
+/// Compute account-wide period spend from all (unfiltered) activity rows.
+pub fn compute_period_spend(rows: &[ActivityRow]) -> PeriodSpend {
+    let today = Utc::now().date_naive();
+    let cutoff_7d = today - chrono::Duration::days(6);
+    let cutoff_30d = today - chrono::Duration::days(29);
+
+    // Find the latest date present in the rows for "last 24h" approximation.
+    let latest_date = rows
+        .iter()
+        .filter_map(|r| NaiveDate::parse_from_str(&r.date, "%Y-%m-%d").ok())
+        .max();
+
+    let mut spend = PeriodSpend::default();
+    for row in rows {
+        let d = match NaiveDate::parse_from_str(&row.date, "%Y-%m-%d") {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if Some(d) == latest_date {
+            spend.last_24h += row.cost;
+        }
+        if d >= cutoff_7d {
+            spend.last_7d += row.cost;
+        }
+        if d >= cutoff_30d {
+            spend.last_30d += row.cost;
+        }
+    }
+    spend
+}
+
+/// Legacy compatibility: aggregate ALL rows (no window filter). Kept for tests that call it directly.
+pub fn parse_activity(body: &str) -> Vec<ModelRow> {
+    aggregate_rows(parse_activity_rows(body))
 }
 
 // ── Receipt rendering ────────────────────────────────────────────────────────
@@ -223,29 +337,28 @@ pub fn render_statement_text(stmt: &OpenRouterStatement, when: DateTime<Utc>) ->
     push(&mut o, lr(" Key", &format!("{} ", trunc_pub(&stmt.key_label, 28))));
     push(&mut o, lr(" Date", &format!("{} ", when.format("%Y-%m-%d %H:%M:%S"))));
 
-    // MODEL BREAKDOWN — aggregated from /activity (last ~30 days).
+    // MODEL BREAKDOWN — aggregated from /activity, filtered to the requested window.
     // Note: /activity covers ~last 30 days; CREDITS total_usage below is lifetime.
     if !stmt.models.is_empty() {
         push(&mut o, rule('-'));
-        push(&mut o, " MODEL BREAKDOWN  (last 30 days)".into());
+        // Header reflects the window ("last 30 days", "last 7 days", "YYYY-MM-DD", etc.)
+        let breakdown_header = format!(" MODEL BREAKDOWN  ({})", stmt.window_label);
+        let breakdown_trunc: String = breakdown_header.chars().take(48).collect();
+        push(&mut o, breakdown_trunc);
         push(&mut o, rule('-'));
         let top: Vec<_> = stmt.models.iter().take(10).collect();
         let rest = stmt.models.len().saturating_sub(10);
         let rest_cost: f64 = stmt.models.iter().skip(10).map(|(_, _, _, c)| c).sum();
         for (model, pt, ct, cost) in &top {
-            // Model name: truncate to leave room for cost on the right
-            // Name col: 48 - 1(space) - cost_width. Cost " $XX.XX" ≤ 8 chars → name ≤ 39.
             let cost_str = format!("{} ", money(*cost));
             let name_budget = 48usize
-                .saturating_sub(1) // leading space
+                .saturating_sub(1)
                 .saturating_sub(cost_str.chars().count());
             let name = trunc_pub(model, name_budget);
             push(&mut o, lr(&format!(" {name}"), &cost_str));
-            // Compact tokens line: "  P: 1,234 + C: 567"
             match (pt, ct) {
                 (Some(p), Some(c)) => {
                     let tok_line = format!("  {} + {} tok", commafy(*p), commafy(*c));
-                    // Truncate if needed (≤48 chars)
                     let tok_trunc: String = tok_line.chars().take(48).collect();
                     push(&mut o, tok_trunc);
                 }
@@ -277,9 +390,18 @@ pub fn render_statement_text(stmt: &OpenRouterStatement, when: DateTime<Utc>) ->
     if let Some(lr_val) = stmt.limit_remaining {
         push(&mut o, lr("   Limit remaining", &format!("{} ", money(lr_val))));
     }
-    push(&mut o, lr("   Spent today", &format!("{} ", money(stmt.usage_daily))));
-    push(&mut o, lr("   This week", &format!("{} ", money(stmt.usage_weekly))));
-    push(&mut o, lr("   This month", &format!("{} ", money(stmt.usage_monthly))));
+
+    // Period spend: account-accurate from /activity when available; fall back to /key fields.
+    if let Some(spend) = &stmt.period_spend {
+        push(&mut o, lr("   Last 24h", &format!("{} ", money(spend.last_24h))));
+        push(&mut o, lr("   Last 7d", &format!("{} ", money(spend.last_7d))));
+        push(&mut o, lr("   Last 30d", &format!("{} ", money(spend.last_30d))));
+    } else {
+        // Non-management key: show key-scoped fields with clear labels.
+        push(&mut o, lr("   Key: today", &format!("{} ", money(stmt.usage_daily))));
+        push(&mut o, lr("   Key: this week", &format!("{} ", money(stmt.usage_weekly))));
+        push(&mut o, lr("   Key: this month", &format!("{} ", money(stmt.usage_monthly))));
+    }
 
     push(&mut o, rule('='));
     push(&mut o, lr(" TOTAL USED", &format!("{} ", money(stmt.total_usage))));
@@ -386,6 +508,48 @@ mod tests {
     const ACTIVITY_403_JSON: &str =
         r#"{"error":{"message":"Only management keys can fetch activity for an account","code":403}}"#;
 
+    /// Multi-day, multi-model fixture for window-filtering tests.
+    /// Dates: 2026-06-10, 2026-06-11, 2026-06-12 — three distinct days.
+    const ACTIVITY_MULTIDAY_JSON: &str = r#"{
+        "data": [
+            {
+                "date": "2026-06-10 00:00:00",
+                "model": "anthropic/claude-sonnet-4.6",
+                "usage": 2.00,
+                "prompt_tokens": 15000,
+                "completion_tokens": 600
+            },
+            {
+                "date": "2026-06-10 00:00:00",
+                "model": "openai/gpt-4o",
+                "usage": 0.50,
+                "prompt_tokens": 2000,
+                "completion_tokens": 100
+            },
+            {
+                "date": "2026-06-11 00:00:00",
+                "model": "anthropic/claude-sonnet-4.6",
+                "usage": 3.00,
+                "prompt_tokens": 20000,
+                "completion_tokens": 800
+            },
+            {
+                "date": "2026-06-12 00:00:00",
+                "model": "anthropic/claude-sonnet-4.6",
+                "usage": 5.50,
+                "prompt_tokens": 35000,
+                "completion_tokens": 1200
+            },
+            {
+                "date": "2026-06-12 00:00:00",
+                "model": "openai/gpt-4o",
+                "usage": 0.75,
+                "prompt_tokens": 3000,
+                "completion_tokens": 250
+            }
+        ]
+    }"#;
+
     #[test]
     fn parse_credits_extracts_values() {
         let (credits, usage) = parse_credits(CREDITS_JSON).unwrap();
@@ -414,12 +578,156 @@ mod tests {
         assert_eq!(ki.label, "");
     }
 
+    // ── parse_activity_rows tests ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_activity_rows_extracts_correct_fields() {
+        let rows = parse_activity_rows(ACTIVITY_MGMT_JSON);
+        assert_eq!(rows.len(), 2, "should parse 2 rows");
+        // Verify date truncation (first 10 chars of "2026-06-12 00:00:00")
+        assert!(rows.iter().all(|r| r.date == "2026-06-12"));
+        // Find claude-opus-4 row
+        let opus = rows.iter().find(|r| r.model == "anthropic/claude-opus-4").unwrap();
+        assert_eq!(opus.prompt, 10000);
+        assert_eq!(opus.completion, 500);
+        assert!((opus.cost - 5.12).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_activity_rows_multiday_fixture_parses_all() {
+        let rows = parse_activity_rows(ACTIVITY_MULTIDAY_JSON);
+        assert_eq!(rows.len(), 5, "should parse all 5 rows from multiday fixture");
+        // Verify all three dates are represented
+        assert!(rows.iter().any(|r| r.date == "2026-06-10"));
+        assert!(rows.iter().any(|r| r.date == "2026-06-11"));
+        assert!(rows.iter().any(|r| r.date == "2026-06-12"));
+    }
+
+    #[test]
+    fn parse_activity_rows_skips_malformed_missing_model() {
+        let json = r#"{"data": [
+            {"date": "2026-06-12 00:00:00", "usage": 1.0, "prompt_tokens": 100, "completion_tokens": 50},
+            {"date": "2026-06-12 00:00:00", "model": "good/model", "usage": 2.0, "prompt_tokens": 200, "completion_tokens": 80}
+        ]}"#;
+        let rows = parse_activity_rows(json);
+        // Row without model is skipped; row with model is included
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "good/model");
+    }
+
+    #[test]
+    fn parse_activity_rows_garbage_returns_empty() {
+        assert!(parse_activity_rows("not json").is_empty());
+        assert!(parse_activity_rows(r#"{"data": "not an array"}"#).is_empty());
+    }
+
+    // ── aggregate_rows tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn aggregate_rows_sums_same_model_across_days() {
+        // Two rows for same model on different days → aggregated into one.
+        let rows = vec![
+            ActivityRow { date: "2026-06-11".into(), model: "a/model".into(), prompt: 1000, completion: 100, cost: 1.0 },
+            ActivityRow { date: "2026-06-12".into(), model: "a/model".into(), prompt: 2000, completion: 200, cost: 2.5 },
+            ActivityRow { date: "2026-06-12".into(), model: "b/model".into(), prompt: 500, completion: 50, cost: 0.5 },
+        ];
+        let result = aggregate_rows(rows);
+        assert_eq!(result.len(), 2);
+        // Sorted by cost desc: a/model (3.5) before b/model (0.5)
+        let (model0, pt0, ct0, cost0) = &result[0];
+        assert_eq!(model0, "a/model");
+        assert_eq!(*pt0, Some(3000));
+        assert_eq!(*ct0, Some(300));
+        assert!((cost0 - 3.5).abs() < 1e-9);
+    }
+
+    // ── Window filtering tests ────────────────────────────────────────────────
+
+    #[test]
+    fn window_day_filters_exact_date() {
+        let rows = parse_activity_rows(ACTIVITY_MULTIDAY_JSON);
+        let target = NaiveDate::from_ymd_opt(2026, 6, 12).unwrap();
+        let window = ActivityWindow::Day(target);
+        let filtered: Vec<ActivityRow> = rows
+            .into_iter()
+            .filter(|r| {
+                NaiveDate::parse_from_str(&r.date, "%Y-%m-%d")
+                    .map(|d| window.includes(d))
+                    .unwrap_or(false)
+            })
+            .collect();
+        // Only 2026-06-12 rows: 2 rows (one per model)
+        assert_eq!(filtered.len(), 2, "Day filter should select exactly the 2 rows on 2026-06-12");
+        assert!(filtered.iter().all(|r| r.date == "2026-06-12"));
+        let aggregated = aggregate_rows(filtered);
+        // claude-sonnet-4.6: $5.50, gpt-4o: $0.75
+        assert_eq!(aggregated.len(), 2);
+        let total: f64 = aggregated.iter().map(|(_, _, _, c)| c).sum();
+        assert!((total - 6.25).abs() < 1e-9, "total for 2026-06-12 should be $6.25, got {total}");
+    }
+
+    #[test]
+    fn window_days_1_selects_most_recent_only() {
+        // With LastDays(1), cutoff = today - 0 days = today.
+        // Since our fixture dates (2026-06-10/11/12) are in the past, this tests
+        // that the filter correctly excludes rows outside the window.
+        // We use a Day window with a known date instead to make this deterministic.
+        let rows = parse_activity_rows(ACTIVITY_MULTIDAY_JSON);
+        let target = NaiveDate::from_ymd_opt(2026, 6, 11).unwrap();
+        let window = ActivityWindow::Day(target);
+        let filtered: Vec<ActivityRow> = rows
+            .into_iter()
+            .filter(|r| {
+                NaiveDate::parse_from_str(&r.date, "%Y-%m-%d")
+                    .map(|d| window.includes(d))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(filtered.len(), 1, "Day(2026-06-11) should select 1 row");
+        assert_eq!(filtered[0].date, "2026-06-11");
+        assert_eq!(filtered[0].model, "anthropic/claude-sonnet-4.6");
+    }
+
+    #[test]
+    fn window_label_last_days() {
+        assert_eq!(ActivityWindow::LastDays(30).label(), "last 30 days");
+        assert_eq!(ActivityWindow::LastDays(7).label(), "last 7 days");
+        assert_eq!(ActivityWindow::LastDays(1).label(), "last 1 days");
+    }
+
+    #[test]
+    fn window_label_day() {
+        let d = NaiveDate::from_ymd_opt(2026, 6, 12).unwrap();
+        assert_eq!(ActivityWindow::Day(d).label(), "2026-06-12");
+    }
+
+    // ── compute_period_spend tests ────────────────────────────────────────────
+
+    #[test]
+    fn compute_period_spend_last_24h_is_latest_date() {
+        // Fixture has dates 2026-06-10, 2026-06-11, 2026-06-12.
+        // Latest date = 2026-06-12. last_24h = sum of 2026-06-12 rows.
+        let rows = parse_activity_rows(ACTIVITY_MULTIDAY_JSON);
+        let spend = compute_period_spend(&rows);
+        // 2026-06-12: claude ($5.50) + gpt-4o ($0.75) = $6.25
+        assert!((spend.last_24h - 6.25).abs() < 1e-9,
+            "last_24h should be $6.25 (sum of 2026-06-12 rows), got {}", spend.last_24h);
+    }
+
+    #[test]
+    fn compute_period_spend_empty_rows() {
+        let spend = compute_period_spend(&[]);
+        assert!((spend.last_24h).abs() < 1e-9);
+        assert!((spend.last_7d).abs() < 1e-9);
+        assert!((spend.last_30d).abs() < 1e-9);
+    }
+
+    // ── Existing parse_activity compatibility tests ───────────────────────────
+
     #[test]
     fn parse_activity_management_key_shape() {
-        // Single-row-per-model fixture — verifies field extraction and cost-desc sort.
         let rows = parse_activity(ACTIVITY_MGMT_JSON);
         assert_eq!(rows.len(), 2);
-        // Sorted by cost descending: claude-opus-4 ($5.12) before gpt-4o ($1.50)
         let (model, pt, ct, cost) = &rows[0];
         assert_eq!(model, "anthropic/claude-opus-4");
         assert_eq!(*pt, Some(10000));
@@ -477,10 +785,8 @@ mod tests {
     #[test]
     fn parse_activity_aggregates_by_model() {
         let rows = parse_activity(ACTIVITY_AGG_JSON);
-        // 4 raw rows → 2 models
         assert_eq!(rows.len(), 2, "expected 2 aggregated models");
 
-        // Sorted by cost descending: claude-sonnet-4.6 ($8.50) before gpt-4o ($1.75)
         let (model0, pt0, ct0, cost0) = &rows[0];
         assert_eq!(model0, "anthropic/claude-sonnet-4.6");
         assert_eq!(*pt0, Some(20000 + 35000), "prompt tokens should be summed");
@@ -496,7 +802,6 @@ mod tests {
 
     #[test]
     fn parse_activity_403_body_returns_empty() {
-        // 403 body has no 'data' array — silently return empty
         let rows = parse_activity(ACTIVITY_403_JSON);
         assert!(rows.is_empty());
     }
@@ -518,6 +823,8 @@ mod tests {
             usage_monthly: 137.141032391,
             limit_remaining: None,
             models: vec![],
+            period_spend: None,
+            window_label: "last 30 days".into(),
         }
     }
 
@@ -551,7 +858,6 @@ mod tests {
     #[test]
     fn render_text_with_models_fits_48_cols() {
         let mut stmt = sample_statement();
-        // 12 models to exercise top-10 cap and "+N more" line
         stmt.models = vec![
             ("anthropic/claude-sonnet-4.6".into(), Some(55_000), Some(2_000), 8.50),
             ("anthropic/claude-opus-4-5-20251101".into(), Some(100_000), Some(5_000), 3.23),
@@ -570,6 +876,60 @@ mod tests {
         assert!(s.contains("MODEL BREAKDOWN"), "should contain MODEL BREAKDOWN");
         assert!(s.contains("last 30 days"), "should mention last 30 days");
         assert!(s.contains("+2 more"), "should have +2 more line for models beyond top 10");
+        for line in s.lines() {
+            assert!(
+                line.chars().count() <= 48,
+                "line too wide ({} chars): {line:?}",
+                line.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn render_text_with_period_spend_fits_48_cols() {
+        let mut stmt = sample_statement();
+        stmt.period_spend = Some(PeriodSpend { last_24h: 6.25, last_7d: 14.5, last_30d: 137.14 });
+        let s = render_statement_text(&stmt, sample_when());
+        assert!(s.contains("Last 24h"), "should show Last 24h");
+        assert!(s.contains("Last 7d"), "should show Last 7d");
+        assert!(s.contains("Last 30d"), "should show Last 30d");
+        for line in s.lines() {
+            assert!(
+                line.chars().count() <= 48,
+                "line too wide ({} chars): {line:?}",
+                line.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn render_text_fallback_key_spend_fits_48_cols() {
+        // When period_spend is None, shows key-scoped fields.
+        let mut stmt = sample_statement();
+        stmt.period_spend = None;
+        stmt.usage_daily = 1.23;
+        stmt.usage_weekly = 4.56;
+        stmt.usage_monthly = 137.14;
+        let s = render_statement_text(&stmt, sample_when());
+        assert!(s.contains("Key: today"), "should show key-scoped label");
+        for line in s.lines() {
+            assert!(
+                line.chars().count() <= 48,
+                "line too wide ({} chars): {line:?}",
+                line.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn render_text_date_window_header_fits_48_cols() {
+        let mut stmt = sample_statement();
+        stmt.window_label = "2026-06-12".into();
+        stmt.models = vec![
+            ("anthropic/claude-sonnet-4.6".into(), Some(35_000), Some(1_200), 5.50),
+        ];
+        let s = render_statement_text(&stmt, sample_when());
+        assert!(s.contains("2026-06-12"), "should show date in header");
         for line in s.lines() {
             assert!(
                 line.chars().count() <= 48,
