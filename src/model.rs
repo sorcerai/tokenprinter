@@ -110,6 +110,9 @@ pub struct Receipt {
     /// When true, the receipt was triggered by a pre-compaction hook.
     /// Renderers may show a "PRE-COMPACTION MEMORIAL" sub-header line.
     pub precompact: bool,
+    /// When Some, the TOTAL is API-equivalent and not an actual charge (subscription billing).
+    /// When None, render the TOTAL unchanged (API billing mode).
+    pub billing_note: Option<String>,
 }
 
 #[cfg(test)]
