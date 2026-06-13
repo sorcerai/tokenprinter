@@ -74,11 +74,12 @@ pub fn print_session(
     let (git, beads, branch) = enrich(&sd);
     let mut receipt = assemble_session(&sd, prices, &cfg.location, git, beads);
     if receipt.git_branch.is_none() { receipt.git_branch = branch; }
+    receipt.billing_note = billing_note(cfg);
     if preview {
         print!("{}", render_text(&receipt));
     } else {
         let bytes = if cfg.show_qr {
-            let qr_data = format!("file://{}", sref.path.display());
+            let qr_data = resume_qr(sref.agent, &sref.session_id);
             render_bytes_with_qr(&receipt, Some(&qr_data))
         } else {
             render_bytes(&receipt)
@@ -86,6 +87,31 @@ pub fn print_session(
         send(&bytes, Mode::parse(&cfg.transport), &cfg.queue_name)?;
     }
     Ok(())
+}
+
+/// Return the agent-appropriate resume command string for use in QR codes.
+///
+/// Scanning or copying the QR lets you jump straight back into the session:
+/// - Claude → `claude --resume <session_id>`
+/// - Codex  → `codex resume <session_id>`
+/// - Pi     → `pi --resume <session_id>`
+/// - Agy    → just the session_id (no well-known resume CLI)
+fn resume_qr(agent: Agent, session_id: &str) -> String {
+    match agent {
+        Agent::Claude => format!("claude --resume {session_id}"),
+        Agent::Codex  => format!("codex resume {session_id}"),
+        Agent::Pi     => format!("pi --resume {session_id}"),
+        Agent::Agy    => session_id.to_string(),
+    }
+}
+
+/// Return the billing note string for subscription mode, or None for API mode.
+fn billing_note(cfg: &Config) -> Option<String> {
+    if cfg.billing == "api" {
+        None
+    } else {
+        Some("API-equivalent \u{2014} not charged on subscription".to_string())
+    }
 }
 
 fn agent_from_str(s: &str) -> anyhow::Result<Agent> {
@@ -130,12 +156,13 @@ pub fn run() -> anyhow::Result<()> {
             let mut receipt = assemble_session(&sd, &prices, &cfg.location, git, beads);
             if receipt.git_branch.is_none() { receipt.git_branch = branch; }
             receipt.precompact = precompact;
+            receipt.billing_note = billing_note(&cfg);
 
             if preview {
                 print!("{}", render_text(&receipt));
             } else {
                 let bytes = if cfg.show_qr {
-                    let qr_data = format!("file://{}", chosen.path.display());
+                    let qr_data = resume_qr(ag, &chosen.session_id);
                     render_bytes_with_qr(&receipt, Some(&qr_data))
                 } else {
                     render_bytes(&receipt)
@@ -299,6 +326,7 @@ fn daily_receipts(prices: &PriceTable, cfg: &Config, date: Option<&str>) -> anyh
             m.session_id = format!("{} daily {}", adapter.agent().slug(), day);
             let mut rc = assemble_session(&m, prices, &cfg.location, GitStats::default(), BeadsStats::default());
             rc.scope = crate::model::Scope::Daily;
+            rc.billing_note = billing_note(cfg);
             out.push(rc);
         }
     }
@@ -413,6 +441,15 @@ mod tests {
     use crate::pricing::PriceTable;
     use chrono::{NaiveDate, TimeZone, Utc};
     use std::path::PathBuf;
+
+    #[test]
+    fn resume_qr_produces_agent_appropriate_command() {
+        assert_eq!(resume_qr(Agent::Claude, "abc123"), "claude --resume abc123");
+        assert_eq!(resume_qr(Agent::Codex,  "abc123"), "codex resume abc123");
+        assert_eq!(resume_qr(Agent::Pi,     "abc123"), "pi --resume abc123");
+        // Agy has no well-known resume CLI — just the session id.
+        assert_eq!(resume_qr(Agent::Agy,    "abc123"), "abc123");
+    }
 
     #[test]
     fn latest_session_picks_most_recent_by_mtime_is_skipped_use_first() {

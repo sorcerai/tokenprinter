@@ -67,6 +67,7 @@ pub fn assemble_session(
         git, beads,
         sparkline: sparkline(sd),
         precompact: false,
+        billing_note: None,
     }
 }
 

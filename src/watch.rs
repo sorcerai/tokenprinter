@@ -65,7 +65,7 @@ fn seed_seen(agent: Agent, seen: &mut HashMap<String, u64>) {
             Ok(t) => t.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs(),
             Err(_) => continue,
         };
-        seen.insert(seen_key(&sref), mtime_secs);
+        seen.insert(seen_key(sref), mtime_secs);
     }
 }
 

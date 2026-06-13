@@ -202,6 +202,11 @@ pub fn render_text(r: &Receipt) -> String {
     push(&mut o, lr(" Sales tax (vibes, 0%)", "$0.00 "));
     push(&mut o, rule('='));
     push(&mut o, lr(" TOTAL", &format!("{} ", r.total_cost.map(money).unwrap_or("—".into()))));
+    if let Some(note) = &r.billing_note {
+        // Truncate to ≤48 cols so the line never exceeds receipt width.
+        let note_trunc: String = note.chars().take(W).collect();
+        push(&mut o, center(&note_trunc));
+    }
     push(&mut o, rule('='));
     push(&mut o, lr(&format!(" Tokens: {}", commafy(r.total_tokens)),
         &match r.burn_rate_per_hr { Some(b)=>format!("Burn: {}/hr ", money(b)), None=>String::from("") }));
@@ -275,6 +280,7 @@ mod tests {
             beads: BeadsStats{opened:vec!["tp-14".into()],closed:vec!["tp-9".into()]},
             sparkline: vec![1,2,3,5,7,6,4,3,2,1],
             precompact: false,
+            billing_note: None,
         }
     }
 
@@ -335,5 +341,27 @@ mod tests {
     #[test]
     fn qr_raster_nonempty_for_normal_data() {
         assert!(!qr_raster("https://example.com/x").is_empty());
+    }
+
+    #[test]
+    fn billing_note_some_renders_not_charged_and_all_lines_fit() {
+        let mut r = sample();
+        r.billing_note = Some("API-equivalent \u{2014} not charged on subscription".to_string());
+        let s = render_text(&r);
+        assert!(s.contains("not charged"), "expected 'not charged' in rendered output");
+        for line in s.lines() {
+            assert!(
+                line.chars().count() <= 48,
+                "line too wide ({} chars): {line:?}", line.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn billing_note_none_does_not_render_not_charged() {
+        let mut r = sample();
+        r.billing_note = None;
+        let s = render_text(&r);
+        assert!(!s.contains("not charged"), "expected no billing note in api mode");
     }
 }

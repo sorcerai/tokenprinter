@@ -15,6 +15,8 @@ pub struct Config {
     pub show_theatrics: bool,
     pub show_qr: bool,
     pub timezone: String,
+    /// Billing mode: "subscription" (not charged) or "api" (actual charge).
+    pub billing: String,
 }
 
 impl Default for Config {
@@ -28,6 +30,7 @@ impl Default for Config {
             show_tools: true, show_productivity: true, show_beads: true,
             show_sparkline: true, show_theatrics: true, show_qr: true,
             timezone: "America/Chicago".into(),
+            billing: "subscription".into(),
         }
     }
 }
