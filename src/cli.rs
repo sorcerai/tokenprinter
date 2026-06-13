@@ -49,6 +49,9 @@ enum Cmd {
         #[arg(long)] idle: Option<u64>,
     },
     /// Watch codex/pi session directories and auto-print when idle.
+    ///
+    /// Note: only sessions that go idle during this daemon's uptime are printed;
+    /// sessions that already exist at startup are intentionally ignored.
     Watch {
         /// Do a single pass and exit (no sleep loop).
         #[arg(long)] once: bool,
