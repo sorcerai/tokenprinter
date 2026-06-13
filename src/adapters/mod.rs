@@ -1,3 +1,4 @@
+pub mod agy;
 pub mod claude;
 pub mod codex;
 pub mod pi;
@@ -22,6 +23,7 @@ pub trait Adapter {
 
 pub fn all_adapters() -> Vec<Box<dyn Adapter>> {
     vec![
+        Box::new(agy::AgyAdapter::new()),
         Box::new(claude::ClaudeAdapter::new()),
         Box::new(codex::CodexAdapter::new()),
         Box::new(pi::PiAdapter::new()),
