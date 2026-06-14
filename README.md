@@ -61,7 +61,7 @@ Inspired by [`chrishutchinson/claude-receipts`](https://github.com/chrishutchins
 - **Multi-agent.** One tool reads the session logs of four different coding agents and normalizes them to a common model.
 - **Correct cost accounting.** Every token category — input, output, cache-write, cache-read — is billed at its own rate. No blended averages. Tool-reported cost wins when present; otherwise a bundled per-model price table is used.
 - **Three scopes.** A single session, a daily rollup across all agents, or on-demand.
-- **Auto-printing.** Claude `Stop`/`PreCompact` hooks print a receipt when a session ends (and a "pre-compaction memorial" before context compaction); a `watch` daemon does the same for Codex/pi.
+- **Auto-printing.** Claude `SessionEnd`/`PreCompact` hooks print a receipt once per session (and a "pre-compaction memorial" before context compaction); a `watch` daemon does the same for Codex/pi. `SessionEnd` fires once when a session ends — not per-response like `Stop` (which would spam a receipt every turn).
 - **Detail.** Per-model token breakdown, tool-call bar chart, git productivity (files/lines/commits), beads tickets opened/closed, a tokens-over-time sparkline, cache-savings, burn rate, and a native QR code.
 - **Subscription-aware.** Costs are API-list-equivalent; on a flat-rate subscription the TOTAL is labeled *"not charged."*
 
@@ -122,7 +122,7 @@ tokenprinter print --agent claude --audit
 tokenprinter doctor
 
 # Auto-printing:
-tokenprinter install-hooks         # Claude Stop + PreCompact (edits ~/.claude/settings.json)
+tokenprinter install-hooks         # Claude SessionEnd + PreCompact (edits ~/.claude/settings.json)
 tokenprinter install-watcher       # writes a launchd plist for the codex/pi watch daemon
 tokenprinter watch --once --preview  # one manual watch pass, no printing
 ```

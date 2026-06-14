@@ -157,8 +157,15 @@ pub fn run() -> anyhow::Result<()> {
             let ag = agent_from_str(&agent)?;
             let adapter = adapter_for(ag).ok_or_else(|| anyhow!("agent {agent} not supported in phase 1"))?;
             let refs = adapter.discover()?;
-            // --last overrides --session: force newest-by-mtime selection
-            let session_key = if last { None } else { session.as_deref() };
+            // --last overrides --session: force newest-by-mtime selection.
+            // An empty --session (e.g. an unset "$CLAUDE_SESSION_ID" in a hook) is
+            // treated as absent so we fall back to newest-by-mtime — during a
+            // SessionEnd/PreCompact hook that is the active session being written.
+            let session_key = if last {
+                None
+            } else {
+                session.as_deref().filter(|s| !s.is_empty())
+            };
             let chosen = pick_session(&refs, session_key)?.clone();
             let sd = adapter.parse(&chosen)?;
 
@@ -210,15 +217,15 @@ pub fn run() -> anyhow::Result<()> {
 
             triggers::hooks::install_hooks(&settings_path, &bin_path)?;
 
-            let stop_cmd = format!(
+            let sessionend_cmd = format!(
                 "{bin_path} print --agent claude --session \"$CLAUDE_SESSION_ID\" --quiet"
             );
             let precompact_cmd = format!(
                 "{bin_path} print --agent claude --session \"$CLAUDE_SESSION_ID\" --precompact --quiet"
             );
             println!("Added hooks to: {}", settings_path.display());
-            println!("  Stop      → {stop_cmd}");
-            println!("  PreCompact→ {precompact_cmd}");
+            println!("  SessionEnd → {sessionend_cmd}");
+            println!("  PreCompact → {precompact_cmd}");
             println!();
             println!(
                 "NOTE: This modified your live Claude settings; remove the tokenprinter entries from {} to undo.",
